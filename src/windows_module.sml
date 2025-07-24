@@ -11,7 +11,7 @@ structure WindowsModule : WINDOWS_MODULE = struct
     results: (string * string) list
   }
   
-  (* Module argument types *)
+  (* Module argument types - internal implementation *)
   type command_args = {
     command: string,
     chdir: string option,
@@ -1408,14 +1408,75 @@ structure WindowsModule : WINDOWS_MODULE = struct
     | "win_updates" => run_win_updates (convert_to_updates_args args)
     | _ => raise ModuleError("Unknown module: " ^ module_name)
     
-  (* Export convenience functions to match the signature *)
-  val win_command = run_win_command
-  val win_copy = run_win_copy
-  val win_shell = run_win_command  (* Shell is the same as command for Windows *)
-  val win_service = run_win_service
-  val win_regedit = run_win_regedit
-  val win_feature = run_win_feature
-  val win_file = run_win_file
-  val win_acl = run_win_acl
-  val win_updates = run_win_updates
+  (* These are the functions that match the signature interface *)
+  (* They adapt between our internal implementation and the expected signature *)
+  
+  fun win_command {command, chdir=chdir_opt, creates=creates_opt, removes=removes_opt} =
+    run_win_command {
+      command = command,
+      chdir = chdir_opt,
+      creates = creates_opt,
+      removes = removes_opt
+    }
+    
+  fun win_shell args = win_command args
+  
+  fun win_copy {src, dest, backup} =
+    run_win_copy {
+      src = SOME src,
+      content = NONE,
+      dest = dest,
+      backup = backup,
+      force = true (* Default to force for signature interface *)
+    }
+  
+  fun win_service {name, display_name=_, path=_, state, startup_mode} =
+    run_win_service {
+      name = name,
+      state = state,
+      startup = case startup_mode of 
+                  SOME "auto" => SOME "auto"
+                | SOME "manual" => SOME "manual"
+                | SOME "disabled" => SOME "disabled"
+                | _ => NONE
+    }
+  
+  fun win_regedit {path, name, data, type_=type_opt, state} =
+    run_win_regedit {
+      path = path,
+      name = SOME name,
+      data = data,
+      type_str = type_opt,
+      state = state
+    }
+  
+  fun win_feature {name, state, restart_if_required=_} =
+    run_win_feature {
+      name = name,
+      state = state
+    }
+  
+  fun win_file {path, state, attributes=_} =
+    run_win_file {
+      path = path,
+      state = state,
+      recurse = true, (* Default values for signature interface *)
+      force = true
+    }
+  
+  fun win_acl {path, user, rights, type_, state=_} =
+    run_win_acl {
+      path = path,
+      user = user,
+      rights = rights,
+      type_str = type_,
+      inherit_flags = NONE (* Default for signature interface *)
+    }
+  
+  fun win_updates {category_names, log_path, state} =
+    run_win_updates {
+      category_names = category_names,
+      log_path = log_path,
+      state = state
+    }
 end
