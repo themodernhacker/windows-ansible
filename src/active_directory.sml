@@ -1,24 +1,44 @@
 (* active_directory.sml
- * Implementation of Windows Active Directory integration
+ * Active Directory integration for Windows Ansible Core
  *)
 
 structure ActiveDirectory : ACTIVE_DIRECTORY = struct
   (* Type definitions *)
-  datatype object_type = USER | GROUP | OU | COMPUTER | ANY
-  
-  type ad_connection = {
-    domain_controller: string option,
+  type connection = {
+    server: string,
+    port: int,
+    use_ssl: bool,
     domain: string,
-    connected: bool ref
+    username: string,
+    connected: bool,
+    connection_string: string
   }
   
   type ad_object = {
     distinguished_name: string,
-    object_type: object_type,
+    object_class: string,
     properties: (string * string) list ref
   }
   
-  exception ADError of string
+  (* Exceptions *)
+  exception ConnectionError of string
+  exception AuthenticationError of string
+  exception QueryError of string
+  exception ObjectNotFound of string
+  
+  (* Default connection *)
+  val default_connection = {
+    server = "",
+    port = 389,
+    use_ssl = false,
+    domain = "",
+    username = "",
+    connected = false,
+    connection_string = ""
+  }
+  
+  (* Current connection state *)
+  val current_connection = ref default_connection
   
   (* Helper function to execute PowerShell commands *)
   fun execute_powershell cmd =
@@ -46,447 +66,515 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     in
       (rc, stdout, stderr)
     end
-  
-  (* Connect to Active Directory *)
-  fun connect domain_controller =
+
+  (* Trim function since String.trim is not available *)
+  fun string_trim s =
     let
-      (* Get current domain if not specified *)
-      val (domain_rc, domain_out, _) = 
-        execute_powershell "(Get-WmiObject Win32_ComputerSystem).Domain"
+      val chars = explode s
       
-      val domain = 
-        if domain_rc = 0 andalso String.size domain_out > 0 then
-          String.substring(domain_out, 0, String.size domain_out - 1) (* Remove newline *)
-        else
-          raise ADError("Failed to determine domain")
-          
-      (* Test connection to domain *)
-      val (test_rc, _, _) = 
-        execute_powershell "try { Get-ADDomain -ErrorAction Stop; $true } catch { $false }"
-        
-      val _ = 
-        if test_rc <> 0 then
-          raise ADError("Failed to connect to Active Directory. Make sure AD PowerShell module is installed.")
-        else
-          ()
+      (* Skip leading whitespace *)
+      fun skipLeading [] = []
+        | skipLeading (c::cs) = 
+            if Char.isSpace c then skipLeading cs else c::cs
+            
+      (* Skip trailing whitespace *)
+      fun skipTrailing [] = []
+        | skipTrailing lst =
+            case List.rev lst of
+              [] => []
+            | (c::cs) => if Char.isSpace c 
+                         then List.rev (skipTrailing (List.rev cs))
+                         else lst
     in
-      {
-        domain_controller = domain_controller,
-        domain = domain,
-        connected = ref true
-      }
+      implode (skipTrailing (skipLeading chars))
+    end
+
+  (* Connect to Active Directory *)
+  fun connect {server, port, use_ssl, domain, username, password} =
+    let
+      (* Build connection string *)
+      val protocol = if use_ssl then "ldaps" else "ldap"
+      val conn_string = protocol ^ "://" ^ server ^ ":" ^ Int.toString port
+      
+      (* Test connection with PowerShell *)
+      val test_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString '" ^ password ^ "' -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  domain ^ "\\" ^ username ^ "', $secpasswd);" ^
+        "  $ldap = New-Object System.DirectoryServices.DirectoryEntry('" ^ 
+                conn_string ^ "', $creds.UserName, $($creds.GetNetworkCredential().Password));" ^
+        "  if ($ldap.Name -ne $null) {" ^
+        "    Write-Output 'Connection successful'" ^
+        "  } else {" ^
+        "    Write-Error 'Connection failed'" ^
+        "  }" ^
+        "} catch {" ^
+        "  Write-Error ('Connection error: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell test_cmd
+    in
+      if rc = 0 andalso String.isSubstring "Connection successful" stdout then
+        (* Update current connection *)
+        let
+          val new_connection = {
+            server = server,
+            port = port,
+            use_ssl = use_ssl,
+            domain = domain,
+            username = username,
+            connected = true,
+            connection_string = conn_string
+          }
+        in
+          current_connection := new_connection;
+          true
+        end
+      else
+        raise ConnectionError (
+          if stderr = "" then 
+            "Failed to connect to Active Directory"
+          else 
+            "Connection error: " ^ stderr
+        )
     end
     
-  (* Disconnect from AD - cleanup resources if needed *)
-  fun disconnect connection =
-    #connected connection := false
+  (* Check if we're connected *)
+  fun is_connected () = #connected (!current_connection)
   
-  (* Convert AD object type to PowerShell filter *)
-  fun object_type_to_filter obj_type =
-    case obj_type of
-      USER => "ObjectClass -eq 'user'"
-    | GROUP => "ObjectClass -eq 'group'"
-    | OU => "ObjectClass -eq 'organizationalUnit'"
-    | COMPUTER => "ObjectClass -eq 'computer'"
-    | ANY => "" (* No filter *)
+  (* Get the current connection *)
+  fun get_connection () = !current_connection
   
-  (* Get AD object by distinguished name *)
-  fun get_object (connection, dn, obj_type) =
+  (* Disconnect *)
+  fun disconnect () = 
+    (current_connection := default_connection; 
+     true)
+  
+  (* Search AD objects *)
+  fun search_objects base_dn filter attributes =
     let
-      val type_filter = object_type_to_filter obj_type
-      
-      (* Build command based on object type *)
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Get-ADObject -Identity '" ^ dn ^ "'" ^
-        (if type_filter <> "" then " -Filter '" ^ type_filter ^ "'" else "") ^
-        " -Properties * | ConvertTo-Json"
-        
-      val (rc, stdout, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to get AD object: " ^ stderr)
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-                
-      (* Very simplified parsing - would use a proper JSON parser in real implementation *)
-      val properties = 
-        let
-          val lines = String.tokens (fn c => c = #"\n") stdout
-          
-          (* Very naive property extraction - just for demonstration *)
-          fun extract_prop line =
-            let
-              val parts = String.tokens (fn c => c = #":") line
-            in
-              if length parts >= 2 then
-                let
-                  val key = String.trim(hd parts)
-                  val value = String.trim(String.concatWith ":" (tl parts))
-                  
-                  (* Remove quotes *)
-                  val key = 
-                    if String.size key >= 2 andalso 
-                       String.sub(key, 0) = #"\"" andalso
-                       String.sub(key, String.size key - 1) = #"\"" then
-                      String.substring(key, 1, String.size key - 2)
+              
+      (* Parse attributes list *)
+      val attrs_str = 
+        if List.length attributes = 0 then 
+          ""
+        else
+          "," ^ String.concatWith "," attributes
+              
+      (* Build search command *)
+      val conn = !current_connection
+      val domain_parts = String.tokens (fn c => c = #".") (#domain conn)
+      val root_dn = if base_dn = "" then
+                      String.concatWith "," 
+                        (map (fn part => "DC=" ^ part) domain_parts)
                     else
-                      key
-                      
-                  val value = 
-                    if String.size value >= 2 andalso 
-                       String.sub(value, 0) = #"\"" andalso
-                       String.sub(value, String.size value - 1) = #"\"" then
-                      String.substring(value, 1, String.size value - 2)
-                    else
-                      value
-                in
-                  SOME (key, value)
-                end
-              else
-                NONE
-            end
+                      base_dn
+                     
+      val search_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain conn) ^ "\\" ^ (#username conn) ^ "', $secpasswd);" ^
+        "  $root = New-Object System.DirectoryServices.DirectoryEntry('" ^ 
+                (#connection_string conn) ^ "/" ^ root_dn ^ 
+                "', $creds.UserName, $($creds.GetNetworkCredential().Password));" ^
+        "  $searcher = New-Object System.DirectoryServices.DirectorySearcher($root);" ^
+        "  $searcher.Filter = '" ^ filter ^ "';" ^
+        "  $searcher.SearchScope = 'Subtree';" ^
+        "  $results = $searcher.FindAll();" ^
+        "  foreach ($result in $results) {" ^
+        "    $dn = $result.Properties['distinguishedname'][0];" ^
+        "    Write-Output \"DN:$dn\";" ^
+        "    foreach ($prop in $result.Properties.Keys) {" ^
+        "      $values = $result.Properties[$prop];" ^
+        "      foreach ($value in $values) {" ^
+        "        Write-Output \"$prop=$value\";" ^
+        "      }" ^
+        "    }" ^
+        "    Write-Output \"---\";" ^
+        "  }" ^
+        "} catch {" ^
+        "  Write-Error ('Search error: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell search_cmd
+      
+      (* Parse results *)
+      val result_lines = String.tokens (fn c => c = #"\n" orelse c = #"\r") stdout
+      
+      (* Group lines by object *)
+      fun parse_lines [] current_obj objects = 
+            if current_obj = [] then objects
+            else List.rev current_obj :: objects
+        | parse_lines ("---"::rest) current_obj objects =
+            parse_lines rest [] (List.rev current_obj :: objects)
+        | parse_lines (line::rest) current_obj objects =
+            parse_lines rest (line :: current_obj) objects
             
-          val props = List.mapPartial extract_prop lines
-          
-          (* Extract distinguished name *)
-          val dn = 
-            case List.find (fn (k, _) => k = "DistinguishedName") props of
-              SOME (_, v) => v
-            | NONE => dn (* Use provided DN if not found *)
+      val grouped_lines = List.rev (parse_lines result_lines [] [])
+      
+      (* Parse each object *)
+      fun parse_object lines =
+        let
+          (* Extract DN and class *)
+          val dn_line = 
+            case List.find (fn l => String.isPrefix "DN:" l) lines of
+              SOME l => string_trim (String.extract(l, 3, NONE))
+            | NONE => raise QueryError "Invalid object format: no DN found"
+            
+          val class_line = 
+            case List.find (fn l => String.isPrefix "objectClass=" l) lines of
+              SOME l => string_trim (String.extract(l, 12, NONE))
+            | NONE => "unknown"
+            
+          (* Parse properties *)
+          fun parse_prop line =
+            case String.tokens (fn c => c = #"=") line of
+              [name, value] => (string_trim name, string_trim value)
+            | _ => ("unknown", line)
+            
+          val props = 
+            List.filter (fn l => String.isSubstring "=" l andalso 
+                                not (String.isPrefix "DN:" l))
+                        lines
+          val properties = map parse_prop props
         in
-          props
+          {
+            distinguished_name = dn_line,
+            object_class = class_line,
+            properties = ref properties
+          }
         end
     in
-      {
-        distinguished_name = dn,
-        object_type = obj_type,
-        properties = ref properties
-      }
+      if rc <> 0 then
+        raise QueryError ("Search failed: " ^ stderr)
+      else
+        map parse_object grouped_lines
     end
-    handle e => raise ADError("Error getting AD object: " ^ exnMessage e)
-  
-  (* Create a new user *)
-  fun create_user (connection, {name, sam_account_name, password, description, container}) =
+    
+  (* Get a single AD object by DN *)
+  fun get_object dn =
     let
-      (* Build command to create user *)
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "New-ADUser -Name '" ^ name ^ "'" ^
-        " -SamAccountName '" ^ sam_account_name ^ "'" ^
-        " -Path '" ^ container ^ "'" ^
-        (case description of 
-           SOME desc => " -Description '" ^ desc ^ "'"
-         | NONE => "") ^
-        (case password of
-           SOME pwd => " -AccountPassword (ConvertTo-SecureString -String '" ^ 
-                       pwd ^ "' -AsPlainText -Force) -Enabled $true"
-         | NONE => "") ^
-        " -PassThru | Select-Object -ExpandProperty DistinguishedName"
-        
-      val (rc, stdout, stderr) = execute_powershell cmd
+      val objects = search_objects "" ("(distinguishedName=" ^ dn ^ ")") []
+    in
+      case objects of
+        [] => raise ObjectNotFound ("Object not found: " ^ dn)
+      | (obj::_) => obj
+    end
+  
+  (* Get a user object *)
+  fun get_user username =
+    let
+      val objects = search_objects "" ("(sAMAccountName=" ^ username ^ ")") []
+    in
+      case objects of
+        [] => raise ObjectNotFound ("User not found: " ^ username)
+      | (obj::_) => obj
+    end
+
+  (* Get a group object *)
+  fun get_group groupname =
+    let
+      val objects = search_objects "" 
+                    ("(&(objectClass=group)(cn=" ^ groupname ^ "))") 
+                    []
+    in
+      case objects of
+        [] => raise ObjectNotFound ("Group not found: " ^ groupname)
+      | (obj::_) => obj
+    end
+
+  (* Get a computer object *)
+  fun get_computer computername =
+    let
+      val objects = search_objects "" 
+                    ("(&(objectClass=computer)(cn=" ^ computername ^ "))") 
+                    []
+    in
+      case objects of
+        [] => raise ObjectNotFound ("Computer not found: " ^ computername)
+      | (obj::_) => obj
+    end
+
+  (* Check if user is member of group *)
+  fun is_user_in_group {user_dn, group_dn} =
+    let
+      (* Get the group object *)
+      val group = get_object group_dn
       
-      val _ = if rc <> 0 then
-                raise ADError("Failed to create user: " ^ stderr)
+      (* Check group membership *)
+      val member_check_cmd =
+        "try {" ^
+        "  $conn = [ADSI]\"" ^ (#connection_string (!current_connection)) ^ "/" ^ group_dn ^ "\";" ^
+        "  $user = [ADSI]\"" ^ (#connection_string (!current_connection)) ^ "/" ^ user_dn ^ "\";" ^
+        "  $members = $conn.Properties['member'];" ^
+        "  if ($members -contains $user.distinguishedName) {" ^
+        "    Write-Output 'TRUE'" ^
+        "  } else {" ^
+        "    Write-Output 'FALSE'" ^
+        "  }" ^
+        "} catch {" ^
+        "  Write-Error ('Membership check failed: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell member_check_cmd
+    in
+      rc = 0 andalso String.isSubstring "TRUE" stdout
+    end
+
+  (* Create user *)
+  fun create_user {parent_ou, username, display_name, 
+                   password=pw, must_change_password=must_change} =
+    let
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-                
-      (* Get the DN of the new user *)
-      val dn = String.substring(stdout, 0, String.size stdout - 1) (* Remove newline *)
+              
+      (* Build command *)
+      val create_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  $userpass = ConvertTo-SecureString '" ^ pw ^ "' -AsPlainText -Force;" ^
+        "  New-ADUser -Credential $creds -SamAccountName '" ^ username ^ "'" ^
+        "    -Name '" ^ display_name ^ "' -DisplayName '" ^ display_name ^ "'" ^
+        "    -Path '" ^ parent_ou ^ "' -AccountPassword $userpass" ^
+        "    -ChangePasswordAtLogon $" ^ (if must_change then "true" else "false") ^ ";" ^
+        "  Write-Output 'User created successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('User creation failed: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell create_cmd
     in
-      get_object(connection, dn, USER)
+      if rc = 0 andalso String.isSubstring "created successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to create user: " ^ stderr)
     end
-    handle e => raise ADError("Error creating user: " ^ exnMessage e)
-  
-  (* Create a new group *)
-  fun create_group (connection, {name, description, group_type, scope, container}) =
+
+  (* Create group *)
+  fun create_group {parent_ou, groupname, description, scope="Global", type="Security"} =
     let
-      (* Convert group scope to PowerShell parameter *)
-      val scope_param = 
-        case scope of
-          "Global" => "Global"
-        | "Universal" => "Universal"
-        | "DomainLocal" => "DomainLocal"
-        | _ => raise ADError("Invalid group scope: " ^ scope)
-        
-      (* Convert group type to PowerShell parameter *)
-      val type_param = 
-        case group_type of
-          "Security" => "Security"
-        | "Distribution" => "Distribution"
-        | _ => raise ADError("Invalid group type: " ^ group_type)
-      
-      (* Build command to create group *)
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "New-ADGroup -Name '" ^ name ^ "'" ^
-        " -GroupCategory '" ^ type_param ^ "'" ^
-        " -GroupScope '" ^ scope_param ^ "'" ^
-        " -Path '" ^ container ^ "'" ^
-        (case description of 
-           SOME desc => " -Description '" ^ desc ^ "'"
-         | NONE => "") ^
-        " -PassThru | Select-Object -ExpandProperty DistinguishedName"
-        
-      val (rc, stdout, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to create group: " ^ stderr)
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-                
-      (* Get the DN of the new group *)
-      val dn = String.substring(stdout, 0, String.size stdout - 1) (* Remove newline *)
-    in
-      get_object(connection, dn, GROUP)
-    end
-    handle e => raise ADError("Error creating group: " ^ exnMessage e)
-  
-  (* Delete an AD object *)
-  fun delete_object (connection, obj) =
-    let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Remove-ADObject -Identity '" ^ (#distinguished_name obj) ^ "' -Confirm:$false"
+              
+      (* Build command *)
+      val create_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  New-ADGroup -Credential $creds -Name '" ^ groupname ^ "'" ^
+        "    -Path '" ^ parent_ou ^ "' -Description '" ^ description ^ "'" ^
+        "    -GroupScope " ^ scope ^ " -GroupCategory " ^ type ^ ";" ^
+        "  Write-Output 'Group created successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('Group creation failed: ' + $_.Exception.Message)" ^
+        "}"
         
-      val (rc, _, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to delete object: " ^ stderr)
+      val (rc, stdout, stderr) = execute_powershell create_cmd
+    in
+      if rc = 0 andalso String.isSubstring "created successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to create group: " ^ stderr)
+    end
+
+  (* Create computer *)
+  fun create_computer {parent_ou, computername, description=""} =
+    let
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-    in
-      ()
-    end
-    handle e => raise ADError("Error deleting object: " ^ exnMessage e)
-  
-  (* Move an AD object to a new container *)
-  fun move_object (connection, obj, new_container) =
-    let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Move-ADObject -Identity '" ^ (#distinguished_name obj) ^ 
-        "' -TargetPath '" ^ new_container ^ "'"
+              
+      (* Build command *)
+      val create_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  New-ADComputer -Credential $creds -Name '" ^ computername ^ "'" ^
+        "    -Path '" ^ parent_ou ^ "'" ^
+        (if description <> "" then " -Description '" ^ description ^ "'" else "") ^ ";" ^
+        "  Write-Output 'Computer created successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('Computer creation failed: ' + $_.Exception.Message)" ^
+        "}"
         
-      val (rc, _, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to move object: " ^ stderr)
+      val (rc, stdout, stderr) = execute_powershell create_cmd
+    in
+      if rc = 0 andalso String.isSubstring "created successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to create computer: " ^ stderr)
+    end
+
+  (* Create OU *)
+  fun create_ou {parent_ou, name, description=""} =
+    let
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-    in
-      ()
-    end
-    handle e => raise ADError("Error moving object: " ^ exnMessage e)
-  
-  (* Add a member to a group *)
-  fun add_to_group (connection, member, group) =
-    let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Add-ADGroupMember -Identity '" ^ (#distinguished_name group) ^ 
-        "' -Members '" ^ (#distinguished_name member) ^ "'"
+              
+      (* Build command *)
+      val create_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  New-ADOrganizationalUnit -Credential $creds -Name '" ^ name ^ "'" ^
+        "    -Path '" ^ parent_ou ^ "'" ^
+        (if description <> "" then " -Description '" ^ description ^ "'" else "") ^ ";" ^
+        "  Write-Output 'OU created successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('OU creation failed: ' + $_.Exception.Message)" ^
+        "}"
         
-      val (rc, _, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to add to group: " ^ stderr)
+      val (rc, stdout, stderr) = execute_powershell create_cmd
+    in
+      if rc = 0 andalso String.isSubstring "created successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to create OU: " ^ stderr)
+    end
+
+  (* Add user to group *)
+  fun add_user_to_group {user_dn, group_dn} =
+    let
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
-    in
-      ()
-    end
-    handle e => raise ADError("Error adding to group: " ^ exnMessage e)
-  
-  (* Remove a member from a group *)
-  fun remove_from_group (connection, member, group) =
-    let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Remove-ADGroupMember -Identity '" ^ (#distinguished_name group) ^ 
-        "' -Members '" ^ (#distinguished_name member) ^ "' -Confirm:$false"
+              
+      (* Build command *)
+      val add_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  Add-ADGroupMember -Credential $creds -Identity '" ^ group_dn ^ "'" ^
+        "    -Members '" ^ user_dn ^ "';" ^
+        "  Write-Output 'User added to group successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('Failed to add user to group: ' + $_.Exception.Message)" ^
+        "}"
         
-      val (rc, _, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to remove from group: " ^ stderr)
-              else
-                ()
+      val (rc, stdout, stderr) = execute_powershell add_cmd
     in
-      ()
+      if rc = 0 andalso String.isSubstring "successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to add user to group: " ^ stderr)
     end
-    handle e => raise ADError("Error removing from group: " ^ exnMessage e)
-  
-  (* Check if an object is a member of a group *)
-  fun is_member_of (connection, member, group) =
+
+  (* Get property from AD object *)
+  fun get_property obj property_name =
     let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "if (Get-ADGroupMember -Identity '" ^ (#distinguished_name group) ^ 
-        "' | Where-Object { $_.DistinguishedName -eq '" ^ (#distinguished_name member) ^ 
-        "' }) { 'True' } else { 'False' }"
-        
-      val (rc, stdout, _) = execute_powershell cmd
-      
-      val result = 
-        if rc = 0 andalso String.isSubstring "True" stdout then
-          true
-        else
-          false
+      val props = !(#properties obj)
+      val prop = List.find (fn (name, _) => name = property_name) props
     in
-      result
-    end
-    handle _ => false
-  
-  (* Get all members of a group *)
-  fun get_group_members (connection, group) =
-    let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Get-ADGroupMember -Identity '" ^ (#distinguished_name group) ^ 
-        "' | Select-Object -ExpandProperty DistinguishedName"
-        
-      val (rc, stdout, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to get group members: " ^ stderr)
-              else
-                ()
-                
-      val member_dns = String.tokens (fn c => c = #"\n") stdout
-      
-      (* Create AD objects for each member *)
-      val members = 
-        List.map (fn dn => 
-                   let
-                     (* Check object type - simplified version *)
-                     val obj_type = 
-                       if String.isSubstring "CN=Users" dn then USER
-                       else if String.isSubstring "OU=" dn then OU
-                       else if String.isSubstring "CN=Computers" dn then COMPUTER
-                       else ANY
-                   in
-                     get_object(connection, dn, obj_type)
-                   end)
-                 member_dns
-    in
-      members
-    end
-    handle e => raise ADError("Error getting group members: " ^ exnMessage e)
-  
-  (* Get a property from an AD object *)
-  fun get_property (obj, property_name) =
-    let
-      val properties = !(#properties obj)
-    in
-      case List.find (fn (name, _) => name = property_name) properties of
+      case prop of
         SOME (_, value) => SOME value
       | NONE => NONE
     end
-  
-  (* Set a property on an AD object *)
-  fun set_property (connection, obj, property_name, property_value) =
+
+  (* Set property on AD object *)
+  fun set_property obj property_name property_value =
     let
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Set-ADObject -Identity '" ^ (#distinguished_name obj) ^ 
-        "' -Replace @{" ^ property_name ^ "='" ^ property_value ^ "'}"
-        
-      val (rc, _, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to set property: " ^ stderr)
-              else
-                (* Update the local property cache *)
-                let
-                  val current_props = !(#properties obj)
-                  val new_props = 
-                    (property_name, property_value) ::
-                    List.filter (fn (name, _) => name <> property_name) current_props
-                in
-                  #properties obj := new_props
-                end
-    in
-      ()
-    end
-    handle e => raise ADError("Error setting property: " ^ exnMessage e)
-  
-  (* Get all properties of an AD object *)
-  fun get_properties obj =
-    !(#properties obj)
-  
-  (* Find AD objects by search criteria *)
-  fun find_objects (connection, search_filter, obj_type) =
-    let
-      val type_filter = object_type_to_filter obj_type
-      
-      (* Combine filters *)
-      val combined_filter = 
-        if type_filter <> "" andalso search_filter <> "" then
-          "(" ^ type_filter ^ ") -and (" ^ search_filter ^ ")"
-        else if type_filter <> "" then
-          type_filter
-        else if search_filter <> "" then
-          search_filter
-        else
-          "*"
-          
-      (* Build search command *)
-      val cmd = 
-        "Import-Module ActiveDirectory; " ^
-        "Get-ADObject -Filter '" ^ combined_filter ^ 
-        "' -Properties DistinguishedName | " ^
-        "Select-Object -ExpandProperty DistinguishedName"
-        
-      val (rc, stdout, stderr) = execute_powershell cmd
-      
-      val _ = if rc <> 0 then
-                raise ADError("Failed to find objects: " ^ stderr)
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
               else
                 ()
                 
-      val object_dns = String.tokens (fn c => c = #"\n" orelse c = #"\r") stdout
-      
-      (* Create AD objects for each result *)
-      val objects = 
-        List.map (fn dn => 
-                   if String.size dn > 0 then
-                     get_object(connection, dn, obj_type)
-                   else
-                     raise ADError("Empty distinguished name returned"))
-                 (List.filter (fn dn => String.size dn > 0) object_dns)
+      (* Build command *)
+      val set_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  Set-ADObject -Credential $creds -Identity '" ^ (#distinguished_name obj) ^ "'" ^
+        "    -Replace @{'" ^ property_name ^ "'='" ^ property_value ^ "'};" ^
+        "  Write-Output 'Property updated successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('Failed to set property: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell set_cmd
     in
-      objects
+      if rc = 0 andalso String.isSubstring "successfully" stdout then
+        let
+          (* Update local cache of properties *)
+          val current_props = !(#properties obj)
+          val new_props = 
+            case List.find (fn (name, _) => name = property_name) current_props of
+              SOME _ => 
+                map (fn (name, value) => 
+                       if name = property_name then 
+                         (name, property_value)
+                       else 
+                         (name, value))
+                    current_props
+            | NONE => (property_name, property_value) :: current_props
+        in
+          (#properties obj) := new_props;
+          true
+        end
+      else
+        raise QueryError ("Failed to set property: " ^ stderr)
     end
-    handle e => raise ADError("Error finding objects: " ^ exnMessage e)
-  
-  (* Find users by search pattern *)
-  fun find_users (connection, search_pattern) =
+
+  (* Delete AD object *)
+  fun delete_object dn =
     let
-      (* Build search filter for users *)
-      val filter = 
-        if String.isSubstring "=" search_pattern then
-          (* Assume it's already a proper LDAP filter *)
-          search_pattern
-        else
-          (* Simple name search *)
-          "Name -like '*" ^ search_pattern ^ "*'"
+      (* Verify connection *)
+      val _ = if not (is_connected()) then
+                raise ConnectionError "Not connected to Active Directory"
+              else
+                ()
+                
+      (* Build command *)
+      val delete_cmd = 
+        "try {" ^
+        "  $secpasswd = ConvertTo-SecureString (Read-Host -AsSecureString) -AsPlainText -Force;" ^
+        "  $creds = New-Object System.Management.Automation.PSCredential('" ^ 
+                  (#domain (!current_connection)) ^ "\\" ^ (#username (!current_connection)) ^ 
+                  "', $secpasswd);" ^
+        "  Remove-ADObject -Credential $creds -Identity '" ^ dn ^ "' -Confirm:$false;" ^
+        "  Write-Output 'Object deleted successfully'" ^
+        "} catch {" ^
+        "  Write-Error ('Failed to delete object: ' + $_.Exception.Message)" ^
+        "}"
+        
+      val (rc, stdout, stderr) = execute_powershell delete_cmd
     in
-      find_objects(connection, filter, USER)
-    end
-  
-  (* Find groups by search pattern *)
-  fun find_groups (connection, search_pattern) =
-    let
-      (* Build search filter for groups *)
-      val filter = 
-        if String.isSubstring "=" search_pattern then
-          (* Assume it's already a proper LDAP filter *)
-          search_pattern
-        else
-          (* Simple name search *)
-          "Name -like '*" ^ search_pattern ^ "*'"
-    in
-      find_objects(connection, filter, GROUP)
+      if rc = 0 andalso String.isSubstring "successfully" stdout then
+        true
+      else
+        raise QueryError ("Failed to delete object: " ^ stderr)
     end
 end

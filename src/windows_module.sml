@@ -3,12 +3,15 @@
  *)
 
 structure WindowsModule : WINDOWS_MODULE = struct
-  (* Type definitions *)
+  (* Type definitions - UPDATED to match signature *)
   type module_result = {
     changed: bool,
     failed: bool,
-    msg: string option,
-    results: (string * string) list
+    msg: string,
+    rc: int option,
+    stdout: string option,
+    stderr: string option,
+    output: (string * string) list
   }
   
   (* Module argument types - internal implementation *)
@@ -142,8 +145,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
           {
             changed = false,
             failed = false,
-            msg = SOME "Skipped execution due to creates/removes condition",
-            results = []
+            msg = "Skipped execution due to creates/removes condition",
+            rc = NONE,
+            stdout = NONE,
+            stderr = NONE,
+            output = []
           }
         else
           let
@@ -160,15 +166,18 @@ structure WindowsModule : WINDOWS_MODULE = struct
             val failed = rc <> 0
             val msg = 
               if failed then
-                SOME ("Command execution failed with exit code " ^ Int.toString rc)
+                "Command execution failed with exit code " ^ Int.toString rc
               else
-                NONE
+                "Command executed successfully"
           in
             {
               changed = true,
               failed = failed,
               msg = msg,
-              results = [
+              rc = SOME rc,
+              stdout = SOME stdout,
+              stderr = SOME stderr,
+              output = [
                 ("rc", Int.toString rc),
                 ("stdout", stdout),
                 ("stderr", stderr)
@@ -244,15 +253,18 @@ structure WindowsModule : WINDOWS_MODULE = struct
           val failed = rc <> 0
           val msg = 
             if failed then
-              SOME ("Failed to change state: " ^ stderr)
+              "Failed to change state: " ^ stderr
             else
-              SOME success_msg
+              success_msg
         in
           {
             changed = true,
             failed = failed,
             msg = msg,
-            results = [
+            rc = SOME rc,
+            stdout = SOME stdout,
+            stderr = SOME stderr,
+            output = [
               ("rc", Int.toString rc),
               ("stdout", stdout),
               ("stderr", stderr)
@@ -266,8 +278,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
         {
           changed = false,
           failed = false,
-          msg = SOME ("File already in desired state"),
-          results = []
+          msg = "File already in desired state",
+          rc = NONE,
+          stdout = NONE,
+          stderr = NONE,
+          output = []
         }
     end
   
@@ -361,15 +376,18 @@ structure WindowsModule : WINDOWS_MODULE = struct
           val failed = rc <> 0
           val msg = 
             if failed then
-              SOME ("Failed to copy content: " ^ stderr)
+              "Failed to copy content: " ^ stderr
             else
-              SOME desc
+              desc
         in
           {
             changed = true,
             failed = failed,
             msg = msg,
-            results = [
+            rc = SOME rc,
+            stdout = SOME stdout,
+            stderr = SOME stderr,
+            output = [
               ("rc", Int.toString rc),
               ("stdout", stdout),
               ("stderr", stderr),
@@ -382,8 +400,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
         {
           changed = false,
           failed = false,
-          msg = SOME ("File exists and force=false"),
-          results = []
+          msg = "File exists and force=false",
+          rc = NONE,
+          stdout = NONE,
+          stderr = NONE,
+          output = []
         }
       else
         perform_copy()
@@ -392,8 +413,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
   
   (* win_service module implementation *)
@@ -418,8 +442,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
           {
             changed = false,
             failed = true,
-            msg = SOME ("Service '" ^ name ^ "' not found"),
-            results = [("stderr", status_stderr)]
+            msg = "Service '" ^ name ^ "' not found",
+            rc = SOME status_rc,
+            stdout = SOME status_stdout,
+            stderr = SOME status_stderr,
+            output = [("stderr", status_stderr)]
           }
         else
           let
@@ -446,17 +473,17 @@ structure WindowsModule : WINDOWS_MODULE = struct
               | NONE => false
               
             (* Apply changes if needed *)
-            val (changed, failed, msg, change_results) = 
+            val (changed, failed, msg, change_results, final_rc, final_stdout, final_stderr) = 
               if needs_state_change orelse needs_startup_change then
                 let
                   (* Change service state if needed *)
-                  val (state_cmd, state_changed, state_failed, state_msg) = 
+                  val (state_cmd, state_changed, state_failed, state_msg, state_rc, state_stdout, state_stderr) = 
                     case (#state args) of
                       SOME "started" => 
                         if current_status <> "started" then
                           let
                             val cmd = "Start-Service -Name '" ^ name ^ "'"
-                            val (rc, _, stderr) = execute_powershell cmd
+                            val (rc, stdout, stderr) = execute_powershell cmd
                             
                             val failed = rc <> 0
                             val msg = 
@@ -465,15 +492,15 @@ structure WindowsModule : WINDOWS_MODULE = struct
                               else
                                 "Service started"
                           in
-                            (cmd, true, failed, msg)
+                            (cmd, true, failed, msg, rc, stdout, stderr)
                           end
                         else
-                          ("", false, false, "")
+                          ("", false, false, "", 0, "", "")
                     | SOME "stopped" => 
                         if current_status <> "stopped" then
                           let
                             val cmd = "Stop-Service -Name '" ^ name ^ "'"
-                            val (rc, _, stderr) = execute_powershell cmd
+                            val (rc, stdout, stderr) = execute_powershell cmd
                             
                             val failed = rc <> 0
                             val msg = 
@@ -482,14 +509,14 @@ structure WindowsModule : WINDOWS_MODULE = struct
                               else
                                 "Service stopped"
                           in
-                            (cmd, true, failed, msg)
+                            (cmd, true, failed, msg, rc, stdout, stderr)
                           end
                         else
-                          ("", false, false, "")
+                          ("", false, false, "", 0, "", "")
                     | SOME "restarted" => 
                         let
                           val cmd = "Restart-Service -Name '" ^ name ^ "'"
-                          val (rc, _, stderr) = execute_powershell cmd
+                          val (rc, stdout, stderr) = execute_powershell cmd
                           
                           val failed = rc <> 0
                           val msg = 
@@ -498,20 +525,20 @@ structure WindowsModule : WINDOWS_MODULE = struct
                             else
                               "Service restarted"
                         in
-                          (cmd, true, failed, msg)
+                          (cmd, true, failed, msg, rc, stdout, stderr)
                         end
-                    | NONE => ("", false, false, "")
+                    | NONE => ("", false, false, "", 0, "", "")
                     | SOME s => 
                         raise ArgumentError("Invalid service state: " ^ s)
                   
                   (* Change startup type if needed *)
-                  val (startup_cmd, startup_changed, startup_failed, startup_msg) = 
+                  val (startup_cmd, startup_changed, startup_failed, startup_msg, startup_rc, startup_stdout, startup_stderr) = 
                     case (#startup args) of
                       SOME "auto" => 
                         if current_startup <> "auto" then
                           let
                             val cmd = "Set-Service -Name '" ^ name ^ "' -StartupType Automatic"
-                            val (rc, _, stderr) = execute_powershell cmd
+                            val (rc, stdout, stderr) = execute_powershell cmd
                             
                             val failed = rc <> 0
                             val msg = 
@@ -520,15 +547,15 @@ structure WindowsModule : WINDOWS_MODULE = struct
                               else
                                 "Startup type set to Automatic"
                           in
-                            (cmd, true, failed, msg)
+                            (cmd, true, failed, msg, rc, stdout, stderr)
                           end
                         else
-                          ("", false, false, "")
+                          ("", false, false, "", 0, "", "")
                     | SOME "manual" => 
                         if current_startup <> "manual" then
                           let
                             val cmd = "Set-Service -Name '" ^ name ^ "' -StartupType Manual"
-                            val (rc, _, stderr) = execute_powershell cmd
+                            val (rc, stdout, stderr) = execute_powershell cmd
                             
                             val failed = rc <> 0
                             val msg = 
@@ -537,15 +564,15 @@ structure WindowsModule : WINDOWS_MODULE = struct
                               else
                                 "Startup type set to Manual"
                           in
-                            (cmd, true, failed, msg)
+                            (cmd, true, failed, msg, rc, stdout, stderr)
                           end
                         else
-                          ("", false, false, "")
+                          ("", false, false, "", 0, "", "")
                     | SOME "disabled" => 
                         if current_startup <> "disabled" then
                           let
                             val cmd = "Set-Service -Name '" ^ name ^ "' -StartupType Disabled"
-                            val (rc, _, stderr) = execute_powershell cmd
+                            val (rc, stdout, stderr) = execute_powershell cmd
                             
                             val failed = rc <> 0
                             val msg = 
@@ -554,11 +581,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
                               else
                                 "Startup type set to Disabled"
                           in
-                            (cmd, true, failed, msg)
+                            (cmd, true, failed, msg, rc, stdout, stderr)
                           end
                         else
-                          ("", false, false, "")
-                    | NONE => ("", false, false, "")
+                          ("", false, false, "", 0, "", "")
+                    | NONE => ("", false, false, "", 0, "", "")
                     | SOME s => 
                         raise ArgumentError("Invalid startup type: " ^ s)
                   
@@ -577,11 +604,16 @@ structure WindowsModule : WINDOWS_MODULE = struct
                     ("state_changed", Bool.toString state_changed),
                     ("startup_changed", Bool.toString startup_changed)
                   ]
+                  
+                  (* Choose the most relevant rc/stdout/stderr *)
+                  val rc = if state_rc <> 0 then state_rc else startup_rc
+                  val stdout = if state_stdout <> "" then state_stdout else startup_stdout
+                  val stderr = if state_stderr <> "" then state_stderr else startup_stderr
                 in
-                  (changed, failed, SOME msg, results)
+                  (changed, failed, msg, results, rc, stdout, stderr)
                 end
               else
-                (false, false, SOME "No changes required", [])
+                (false, false, "No changes required", [], 0, "", "")
                 
             (* Get final service status *)
             val final_status_cmd = 
@@ -612,7 +644,10 @@ structure WindowsModule : WINDOWS_MODULE = struct
               changed = changed,
               failed = failed,
               msg = msg,
-              results = info_results @ change_results
+              rc = SOME final_rc,
+              stdout = SOME final_stdout,
+              stderr = SOME final_stderr,
+              output = info_results @ change_results
             }
           end
     in
@@ -622,8 +657,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
   
   (* win_feature module implementation *)
@@ -650,8 +688,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
           {
             changed = false,
             failed = true,
-            msg = SOME ("Feature '" ^ name ^ "' not found"),
-            results = [("stderr", check_stderr)]
+            msg = "Feature '" ^ name ^ "' not found",
+            rc = SOME check_rc,
+            stdout = SOME check_stdout,
+            stderr = SOME check_stderr,
+            output = [("stderr", check_stderr)]
           }
         else
           let
@@ -664,7 +705,7 @@ structure WindowsModule : WINDOWS_MODULE = struct
               (state = "absent" andalso is_installed)
               
             (* Apply change if needed *)
-            val (changed, failed, msg, cmd_results) = 
+            val (changed, failed, msg, cmd_results, final_rc, final_stdout, final_stderr) = 
               if needs_change then
                 let
                   val cmd = 
@@ -687,18 +728,21 @@ structure WindowsModule : WINDOWS_MODULE = struct
                     else
                       "Feature " ^ (if state = "present" then "installed" else "removed")
                 in
-                  (true, failed, msg, [("stdout", stdout), ("stderr", stderr)])
+                  (true, failed, msg, [("stdout", stdout), ("stderr", stderr)], rc, stdout, stderr)
                 end
               else
                 (false, false, 
                  "Feature already " ^ (if state = "present" then "installed" else "absent"),
-                 [])
+                 [], 0, "", "")
           in
             {
               changed = changed,
               failed = failed,
-              msg = SOME msg,
-              results = [
+              msg = msg,
+              rc = if changed then SOME final_rc else NONE,
+              stdout = if changed then SOME final_stdout else NONE,
+              stderr = if changed then SOME final_stderr else NONE,
+              output = [
                 ("name", name),
                 ("state", state),
                 ("installed", Bool.toString (if changed then state = "present" else is_installed))
@@ -712,8 +756,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
   
   (* win_regedit module implementation *)
@@ -749,16 +796,22 @@ structure WindowsModule : WINDOWS_MODULE = struct
                   {
                     changed = true,
                     failed = failed,
-                    msg = SOME msg,
-                    results = [("stdout", stdout), ("stderr", stderr)]
+                    msg = msg,
+                    rc = SOME rc,
+                    stdout = SOME stdout,
+                    stderr = SOME stderr,
+                    output = [("stdout", stdout), ("stderr", stderr)]
                   }
                 end
               else
                 {
                   changed = false,
                   failed = false,
-                  msg = SOME "Registry key already exists",
-                  results = []
+                  msg = "Registry key already exists",
+                  rc = NONE,
+                  stdout = NONE,
+                  stderr = NONE,
+                  output = []
                 }
             else (* state = "absent" *)
               if path_exists then
@@ -777,16 +830,22 @@ structure WindowsModule : WINDOWS_MODULE = struct
                   {
                     changed = true,
                     failed = failed,
-                    msg = SOME msg,
-                    results = [("stdout", stdout), ("stderr", stderr)]
+                    msg = msg,
+                    rc = SOME rc,
+                    stdout = SOME stdout,
+                    stderr = SOME stderr,
+                    output = [("stdout", stdout), ("stderr", stderr)]
                   }
                 end
               else
                 {
                   changed = false,
                   failed = false,
-                  msg = SOME "Registry key does not exist",
-                  results = []
+                  msg = "Registry key does not exist",
+                  rc = NONE,
+                  stdout = NONE,
+                  stderr = NONE,
+                  output = []
                 }
         | SOME name => 
             (* Handle registry value operations *)
@@ -884,16 +943,22 @@ structure WindowsModule : WINDOWS_MODULE = struct
                         {
                           changed = true,
                           failed = failed,
-                          msg = SOME msg,
-                          results = [("stdout", stdout), ("stderr", stderr)]
+                          msg = msg,
+                          rc = SOME rc,
+                          stdout = SOME stdout,
+                          stderr = SOME stderr,
+                          output = [("stdout", stdout), ("stderr", stderr)]
                         }
                       end
                     else
                       {
                         changed = false,
                         failed = false,
-                        msg = SOME "Registry value already set correctly",
-                        results = []
+                        msg = "Registry value already set correctly",
+                        rc = NONE,
+                        stdout = NONE,
+                        stderr = NONE,
+                        output = []
                       }
                 | _ => raise ArgumentError("Both data and type must be specified for present state")
               else (* state = "absent" *)
@@ -913,16 +978,22 @@ structure WindowsModule : WINDOWS_MODULE = struct
                     {
                       changed = true,
                       failed = failed,
-                      msg = SOME msg,
-                      results = [("stdout", stdout), ("stderr", stderr)]
+                      msg = msg,
+                      rc = SOME rc,
+                      stdout = SOME stdout,
+                      stderr = SOME stderr,
+                      output = [("stdout", stdout), ("stderr", stderr)]
                     }
                   end
                 else
                   {
                     changed = false,
                     failed = false,
-                    msg = SOME "Registry value does not exist",
-                    results = []
+                    msg = "Registry value does not exist",
+                    rc = NONE,
+                    stdout = NONE,
+                    stderr = NONE,
+                    output = []
                   }
             end
     in
@@ -932,8 +1003,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
   
   (* win_acl module implementation *)
@@ -1018,16 +1092,22 @@ structure WindowsModule : WINDOWS_MODULE = struct
             {
               changed = true,
               failed = failed,
-              msg = SOME msg,
-              results = [("stdout", stdout), ("stderr", stderr)]
+              msg = msg,
+              rc = SOME rc,
+              stdout = SOME stdout,
+              stderr = SOME stderr,
+              output = [("stdout", stdout), ("stderr", stderr)]
             }
           end
         else
           {
             changed = false,
             failed = false,
-            msg = SOME "ACL rule already exists",
-            results = []
+            msg = "ACL rule already exists",
+            rc = NONE,
+            stdout = NONE,
+            stderr = NONE,
+            output = []
           }
     in
       result
@@ -1036,8 +1116,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
   
   (* win_updates module implementation *)
@@ -1099,8 +1182,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
           {
             changed = false,
             failed = failed,
-            msg = SOME msg,
-            results = [
+            msg = msg,
+            rc = SOME rc,
+            stdout = SOME stdout,
+            stderr = SOME stderr,
+            output = [
               ("updates_found", Int.toString updates_count),
               ("updates", stdout)
             ]
@@ -1168,8 +1254,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
           {
             changed = updates_count > 0 andalso success,
             failed = failed orelse (updates_count > 0 andalso not success),
-            msg = SOME msg,
-            results = [
+            msg = msg,
+            rc = SOME rc,
+            stdout = SOME stdout,
+            stderr = SOME stderr,
+            output = [
               ("updates_installed", Int.toString updates_count),
               ("reboot_required", if success andalso stdout = "3" then "true" else "false"),
               ("stdout", stdout),
@@ -1187,8 +1276,11 @@ structure WindowsModule : WINDOWS_MODULE = struct
       {
         changed = false,
         failed = true,
-        msg = SOME (exnMessage e),
-        results = []
+        msg = exnMessage e,
+        rc = NONE,
+        stdout = NONE,
+        stderr = NONE,
+        output = []
       }
 
   (* Helper functions to convert between arg types for module dispatch *)
