@@ -190,7 +190,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Disconnect *)
-  fun disconnect conn = (current_connection := default_connection)
+  fun disconnect _ = (current_connection := default_connection)
   
   (* Object type string conversion *)
   fun object_type_to_string USER = "user"
@@ -206,7 +206,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     | string_to_object_type _ = ANY
   
   (* Get a single AD object by DN *)
-  fun get_object (conn, dn, obj_type) =
+  fun get_object (_, dn, obj_type) =
     let
       val type_filter = 
         case obj_type of
@@ -266,7 +266,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
         | NONE => "unknown"
           
       (* Determine object type from class *)
-      val obj_type = 
+      val determined_obj_type = 
         if String.isSubstring "user" class_line then USER
         else if String.isSubstring "group" class_line then GROUP
         else if String.isSubstring "computer" class_line then COMPUTER
@@ -292,13 +292,13 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
         {
           distinguished_name = dn_line,
           object_class = class_line,
-          object_type = obj_type,
+          object_type = determined_obj_type,
           properties = properties
         }
     end
   
   (* Create user *)
-  fun create_user (conn, {container, name, sam_account_name, description, password}) =
+  fun create_user (_, {container, name, sam_account_name, description, password}) =
     let
       val pw = case password of SOME p => p | NONE => ""
       val desc = case description of SOME d => d | NONE => ""
@@ -369,7 +369,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Create group *)
-  fun create_group (conn, {container, name, description, scope, group_type}) =
+  fun create_group (_, {container, name, description, scope, group_type}) =
     let
       val desc = case description of SOME d => d | NONE => ""
       
@@ -438,7 +438,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Delete AD object *)
-  fun delete_object (conn, obj) =
+  fun delete_object (_, obj: ad_object) =
     let
       val dn = #distinguished_name obj
       
@@ -463,7 +463,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Move AD object *)
-  fun move_object (conn, obj, new_container) =
+  fun move_object (_, obj: ad_object, new_container) =
     let
       val dn = #distinguished_name obj
       
@@ -473,14 +473,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
         "  $domain = '" ^ (#domain (!current_connection)) ^ "';" ^
         "  $username = '" ^ (#username (!current_connection)) ^ "';" ^
         "  Move-ADObject -Identity '" ^ dn ^ "' -TargetPath '" ^ new_container ^ "';" ^
-        "  $movedObj = Get-ADObject -Identity '" ^ dn ^ "' -Properties *;" ^
-        "  Write-Output \"DN=$($movedObj.DistinguishedName)\";" ^
-        "  Write-Output \"ObjectClass=$($movedObj.ObjectClass)\";" ^
-        "  foreach ($prop in $movedObj.PropertyNames) {" ^
-        "    foreach ($val in $movedObj.$prop) {" ^
-        "      Write-Output \"$prop=$val\";" ^
-        "    }" ^
-        "  }" ^
+        "  Write-Output 'Object moved successfully'" ^
         "} catch {" ^
         "  Write-Error ('Failed to move object: ' + $_.Exception.Message)" ^
         "  exit 1" ^
@@ -495,7 +488,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Add user/computer to group *)
-  fun add_to_group (conn, obj, group_obj) =
+  fun add_to_group (_, obj: ad_object, group_obj: ad_object) =
     let
       val member_dn = #distinguished_name obj
       val group_dn = #distinguished_name group_obj
@@ -522,7 +515,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Remove from group *)
-  fun remove_from_group (conn, obj, group_obj) =
+  fun remove_from_group (_, obj: ad_object, group_obj: ad_object) =
     let
       val member_dn = #distinguished_name obj
       val group_dn = #distinguished_name group_obj
@@ -549,7 +542,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Check if member of group *)
-  fun is_member_of (conn, obj, group_obj) =
+  fun is_member_of (_, obj: ad_object, group_obj: ad_object) =
     let
       val member_dn = #distinguished_name obj
       val group_dn = #distinguished_name group_obj
@@ -580,7 +573,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Get group members *)
-  fun get_group_members (conn, group_obj) =
+  fun get_group_members (_, group_obj: ad_object) =
     let
       val group_dn = #distinguished_name group_obj
       
@@ -679,7 +672,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Property management *)
-  fun get_property (obj, property_name) =
+  fun get_property (obj: ad_object, property_name) =
     let
       val properties = #properties obj
     in
@@ -688,7 +681,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
       | NONE => NONE
     end
   
-  fun set_property (conn, obj, property_name, property_value) =
+  fun set_property (_, obj: ad_object, property_name, property_value) =
     let
       val dn = #distinguished_name obj
       
@@ -714,10 +707,10 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Get all properties *)
-  fun get_properties obj = #properties obj
+  fun get_properties (obj: ad_object) = #properties obj
   
   (* Find objects *)
-  fun find_objects (conn, base_dn, obj_type) =
+  fun find_objects (_, base_dn, obj_type) =
     let
       (* Build filter based on object type *)
       val filter =
@@ -838,13 +831,6 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
       (* Determine base DN from domain *)
       val domain_parts = String.tokens (fn c => c = #".") (#domain (!current_connection))
       val base_dn = String.concatWith "," (map (fn part => "DC=" ^ part) domain_parts)
-      
-      (* Build filter *)
-      val filter = 
-        if name_filter = "" then
-          "(objectClass=user)"
-        else
-          "(&(objectClass=user)(cn=*" ^ name_filter ^ "*))"
     in
       find_objects (conn, base_dn, USER)
     end
@@ -855,13 +841,6 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
       (* Determine base DN from domain *)
       val domain_parts = String.tokens (fn c => c = #".") (#domain (!current_connection))
       val base_dn = String.concatWith "," (map (fn part => "DC=" ^ part) domain_parts)
-      
-      (* Build filter *)
-      val filter = 
-        if name_filter = "" then
-          "(objectClass=group)"
-        else
-          "(&(objectClass=group)(cn=*" ^ name_filter ^ "*))"
     in
       find_objects (conn, base_dn, GROUP)
     end
