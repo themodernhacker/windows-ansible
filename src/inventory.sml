@@ -1,339 +1,414 @@
 (* inventory.sml
- * Implementation of Ansible-compatible inventory system
+ * Ansible-compatible inventory management
  *)
 
 structure Inventory : INVENTORY = struct
-  (* Host and group types *)
+  (* Type definitions *)
+  type host_vars = (string * string) list
+  type group_vars = (string * string) list
+
   type host = {
     name: string,
-    vars: (string * string) list ref
+    vars: host_vars ref
   }
   
   type group = {
     name: string,
-    vars: (string * string) list ref,
-    hosts: string list ref
+    hosts: string list ref,
+    vars: group_vars ref,
+    children: string list ref
   }
   
   type inventory = {
     hosts: (string, host) HashTable.hash_table,
     groups: (string, group) HashTable.hash_table,
-    dynamic_sources: (unit -> (string * (string * string) list) list) list ref
+    dynamic_sources: (unit -> (string * host_vars) list) list ref
   }
   
-  type host_vars = (string * string) list
-  type group_vars = (string * string) list
-  
+  (* Exceptions *)
   exception InventoryError of string
   
-  (* Create an empty inventory *)
+  (* Custom string trim function *)
+  fun string_trim s =
+    let
+      val chars = explode s
+      
+      (* Skip leading whitespace *)
+      fun skipLeading [] = []
+        | skipLeading (c::cs) = 
+            if Char.isSpace c then skipLeading cs else c::cs
+            
+      (* Skip trailing whitespace *)
+      fun skipTrailing [] = []
+        | skipTrailing lst =
+            case List.rev lst of
+              [] => []
+            | (c::cs) => if Char.isSpace c 
+                         then List.rev (skipTrailing (List.rev cs))
+                         else lst
+    in
+      implode (skipTrailing (skipLeading chars))
+    end
+  
+  (* Create a new empty inventory *)
   fun create () = {
-    hosts = HashTable.mkTable (HashString.hashString, op=) (101, InventoryError "Host not found"),
-    groups = HashTable.mkTable (HashString.hashString, op=) (101, InventoryError "Group not found"),
+    hosts = HashTable.mkTable (HashString.hashString, op=) (50, Fail "Host not found"),
+    groups = HashTable.mkTable (HashString.hashString, op=) (20, Fail "Group not found"),
     dynamic_sources = ref []
   }
   
-  (* Parse simple INI-style inventory files (simplified version) *)
-  fun load_file filename = 
-    let
-      val inventory = create()
-      val file = TextIO.openIn filename
-      
-      fun process_line (line, current_group) =
-        if String.size line = 0 orelse String.sub(line, 0) = #"#"
-        then current_group  (* Skip empty lines and comments *)
-        else if String.sub(line, 0) = #"[" andalso 
-                String.sub(line, String.size line - 1) = #"]"
-        then  (* Group header *)
-          let
-            val group_name = String.substring(line, 1, String.size line - 2)
-            val _ = add_group(inventory, group_name, [])
-          in
-            SOME group_name
-          end
-        else  (* Host line *)
-          let
-            val tokens = String.tokens (fn c => c = #" ") line
-            val hostname = hd tokens
-            
-            (* Process any variables on the line *)
-            val vars = 
-              if length tokens > 1
-              then 
-                let
-                  val var_strings = tl tokens
-                  fun parse_var str =
-                    case String.fields (fn c => c = #"=") str of
-                      [key, value] => (key, value)
-                    | _ => raise InventoryError("Invalid variable format: " ^ str)
-                in
-                  map parse_var var_strings
-                end
-              else []
-              
-            (* Add the host *)
-            val host = add_host(inventory, hostname, vars)
-            
-            (* Add to current group if any *)
-            val _ = case current_group of
-                      SOME group => add_host_to_group(inventory, hostname, group)
-                    | NONE => ()
-          in
-            current_group
-          end
-      
-      (* Process all lines in the file *)
-      fun process_lines current_group =
-        case TextIO.inputLine file of
-          SOME line => 
-            let
-              val line = String.trimr 1 line  (* Remove newline *)
-              val new_group = process_line(line, current_group)
-            in
-              process_lines new_group
-            end
-        | NONE => ()
-        
-      val _ = process_lines NONE
-      val _ = TextIO.closeIn file
-    in
-      inventory
-    end
-    handle IO.Io {name, ...} => 
-      raise InventoryError("Failed to load inventory file: " ^ name)
-  
-  (* Save inventory to a file in INI format *)
-  fun save_file (inventory, filename) =
-    let
-      val file = TextIO.openOut filename
-      
-      (* Write all hosts not in any group *)
-      val all_hosts = list_hosts inventory
-      val all_groups = list_groups inventory
-      
-      fun is_in_any_group hostname =
-        List.exists (fn group => 
-          List.exists (fn h => h = hostname) 
-                      (get_group_hosts(inventory, group)))
-                    all_groups
-      
-      val ungrouped = List.filter (fn h => not (is_in_any_group h)) all_hosts
-      
-      (* Write ungrouped hosts *)
-      val _ = TextIO.output(file, "[ungrouped]\n")
-      val _ = List.app (fn h => 
-                  let
-                    val host_vars = get_host_vars(inventory, h)
-                    val var_str = String.concatWith " " 
-                                   (map (fn (k, v) => k ^ "=" ^ v) host_vars)
-                  in
-                    TextIO.output(file, h ^ " " ^ var_str ^ "\n")
-                  end) ungrouped
-      
-      (* Write each group *)
-      val _ = List.app (fn group => 
-                let
-                  (* Write group header *)
-                  val _ = TextIO.output(file, "\n[" ^ group ^ "]\n")
-                  
-                  (* Write group variables as [group:vars] section *)
-                  val group_vars = get_group_vars(inventory, group)
-                  val _ = if not (null group_vars) then
-                            (TextIO.output(file, "\n[" ^ group ^ ":vars]\n");
-                             List.app (fn (k, v) => 
-                               TextIO.output(file, k ^ "=" ^ v ^ "\n")) group_vars)
-                          else ()
-                  
-                  (* Write hosts in this group *)
-                  val hosts = get_group_hosts(inventory, group)
-                  val _ = List.app (fn h =>
-                            let
-                              val host_vars = get_host_vars(inventory, h)
-                              val var_str = String.concatWith " " 
-                                            (map (fn (k, v) => k ^ "=" ^ v) host_vars)
-                            in
-                              TextIO.output(file, h ^ " " ^ var_str ^ "\n")
-                            end) hosts
-                in
-                  ()
-                end) all_groups
-                
-      val _ = TextIO.closeOut file
-    in
-      ()
-    end
-    handle IO.Io {name, ...} => 
-      raise InventoryError("Failed to save inventory file: " ^ name)
-  
-  (* Host management functions *)
-  fun add_host (inventory, hostname, vars) =
-    let
-      val host = {
-        name = hostname,
-        vars = ref vars
-      }
-    in
-      (HashTable.insert (#hosts inventory) (hostname, host); host)
-    end
-  
-  fun remove_host (inventory, hostname) =
-    (HashTable.remove (#hosts inventory) hostname;
-     
-     (* Also remove from all groups *)
-     HashTable.appi (fn (group_name, group) => 
-       let
-         val hosts = !(#hosts group)
-         val new_hosts = List.filter (fn h => h <> hostname) hosts
-       in
-         #hosts group := new_hosts
-       end) (#groups inventory))
-  
-  fun get_host (inventory, hostname) =
-    SOME (HashTable.lookup (#hosts inventory) hostname)
-    handle _ => NONE
-  
-  fun list_hosts inventory =
-    HashTable.foldi (fn (name, _, acc) => name :: acc) [] (#hosts inventory)
-  
-  (* Group management functions *)
-  fun add_group (inventory, group_name, vars) =
+  (* Add a group to inventory *)
+  fun add_group (inv: inventory, name, init_vars) =
     let
       val group = {
-        name = group_name,
-        vars = ref vars,
-        hosts = ref []
+        name = name,
+        hosts = ref [],
+        vars = ref init_vars,
+        children = ref []
       }
     in
-      (HashTable.insert (#groups inventory) (group_name, group); group)
+      HashTable.insert (#groups inv) (name, group);
+      group
     end
   
-  fun remove_group (inventory, group_name) =
-    HashTable.remove (#groups inventory) group_name
+  (* Get a group from inventory *)
+  fun get_group (inv: inventory, name) =
+    HashTable.find (#groups inv) name
   
-  fun get_group (inventory, group_name) =
-    SOME (HashTable.lookup (#groups inventory) group_name)
-    handle _ => NONE
+  (* Remove a group *)
+  fun remove_group (inv: inventory, name) =
+    let
+      (* Remove group from children lists of all other groups *)
+      val _ = HashTable.appi 
+                (fn (_, group) => 
+                   (#children group) := 
+                     List.filter (fn child => child <> name) (!(#children group)))
+                (#groups inv)
+    in
+      HashTable.remove (#groups inv) name
+      handle _ => raise InventoryError ("Group not found: " ^ name)
+    end
   
-  fun list_groups inventory =
-    HashTable.foldi (fn (name, _, acc) => name :: acc) [] (#groups inventory)
+  (* Add a host to inventory *)
+  fun add_host (inv: inventory, name, init_vars) =
+    let
+      val host = {
+        name = name,
+        vars = ref init_vars
+      }
+    in
+      HashTable.insert (#hosts inv) (name, host);
+      host
+    end
   
-  (* Membership management *)
-  fun add_host_to_group (inventory, hostname, group_name) =
-    case get_group (inventory, group_name) of
-      SOME group => 
+  (* Get a host from inventory *)
+  fun get_host (inv: inventory, name) =
+    HashTable.find (#hosts inv) name
+  
+  (* Remove a host *)
+  fun remove_host (inv: inventory, name) =
+    let
+      (* Remove host from all groups *)
+      val _ = HashTable.appi 
+                (fn (_, group) => 
+                   (#hosts group) := 
+                     List.filter (fn host => host <> name) (!(#hosts group)))
+                (#groups inv)
+    in
+      HashTable.remove (#hosts inv) name
+      handle _ => raise InventoryError ("Host not found: " ^ name)
+    end
+  
+  (* List all hosts *)
+  fun list_hosts (inv: inventory) =
+    let
+      val host_list = ref []
+      val _ = HashTable.appi (fn (name, _) => host_list := name :: !host_list) (#hosts inv)
+    in
+      !host_list
+    end
+  
+  (* List all groups *)
+  fun list_groups (inv: inventory) =
+    let
+      val group_list = ref []
+      val _ = HashTable.appi (fn (name, _) => group_list := name :: !group_list) (#groups inv)
+    in
+      !group_list
+    end
+  
+  (* Add host to group *)
+  fun add_host_to_group (inv: inventory, hostname, groupname) =
+    case get_group (inv, groupname) of
+      SOME group =>
         let
-          val hosts = !(#hosts group)
+          val host_exists = case get_host (inv, hostname) of
+                              SOME _ => true
+                            | NONE => false
         in
-          if List.exists (fn h => h = hostname) hosts
-          then () (* Already in group *)
-          else #hosts group := hostname :: hosts
+          if not host_exists then
+            ignore(add_host (inv, hostname, []))
+          else
+            ();
+            
+          if not (List.exists (fn h => h = hostname) (!(#hosts group))) then
+            (#hosts group) := hostname :: (!(#hosts group))
+          else
+            ()
         end
-    | NONE => raise InventoryError("Group not found: " ^ group_name)
+    | NONE => raise InventoryError ("Group not found: " ^ groupname)
   
-  fun remove_host_from_group (inventory, hostname, group_name) =
-    case get_group (inventory, group_name) of
-      SOME group => 
-        let
-          val hosts = !(#hosts group)
-          val new_hosts = List.filter (fn h => h <> hostname) hosts
-        in
-          #hosts group := new_hosts
-        end
-    | NONE => raise InventoryError("Group not found: " ^ group_name)
+  (* Remove host from group *)
+  fun remove_host_from_group (inv: inventory, hostname, groupname) =
+    case get_group (inv, groupname) of
+      SOME group =>
+        (#hosts group) := List.filter (fn h => h <> hostname) (!(#hosts group))
+    | NONE => raise InventoryError ("Group not found: " ^ groupname)
   
-  fun get_group_hosts (inventory, group_name) =
-    case get_group (inventory, group_name) of
+  (* Get hosts in a group *)
+  fun get_group_hosts (inv: inventory, group_name) =
+    case get_group (inv, group_name) of
       SOME group => !(#hosts group)
-    | NONE => raise InventoryError("Group not found: " ^ group_name)
+    | NONE => raise InventoryError ("Group not found: " ^ group_name)
   
-  fun get_host_groups (inventory, hostname) =
-    HashTable.foldi (fn (group_name, group, acc) => 
-      if List.exists (fn h => h = hostname) (!(#hosts group))
-      then group_name :: acc
-      else acc) [] (#groups inventory)
+  (* Get groups a host belongs to *)
+  fun get_host_groups (inv: inventory, host_name) =
+    let
+      val groups = ref []
+      val _ = HashTable.appi 
+                (fn (name, group) => 
+                   if List.exists (fn h => h = host_name) (!(#hosts group))
+                   then groups := name :: !groups
+                   else ())
+                (#groups inv)
+    in
+      !groups
+    end
   
-  (* Variable management *)
-  fun get_host_vars (inventory, hostname) =
-    case get_host (inventory, hostname) of
+  (* Get host variables *)
+  fun get_host_vars (inv: inventory, host_name) =
+    case get_host (inv, host_name) of
       SOME host => !(#vars host)
-    | NONE => raise InventoryError("Host not found: " ^ hostname)
+    | NONE => raise InventoryError ("Host not found: " ^ host_name)
   
-  fun set_host_var (inventory, hostname, key, value) =
-    case get_host (inventory, hostname) of
+  (* Set host variable *)
+  fun set_host_var (inv: inventory, host_name, key, value) =
+    case get_host (inv, host_name) of
       SOME host => 
         let
-          val vars = !(#vars host)
-          val vars' = (key, value) :: 
-                      List.filter (fn (k, _) => k <> key) vars
+          val current_vars = !(#vars host)
+          val new_vars = 
+            case List.find (fn (k, _) => k = key) current_vars of
+              SOME _ => 
+                map (fn (k, v) => 
+                       if k = key then 
+                         (k, value)
+                       else 
+                         (k, v))
+                    current_vars
+            | NONE => (key, value) :: current_vars
         in
-          #vars host := vars'
+          (#vars host) := new_vars
         end
-    | NONE => raise InventoryError("Host not found: " ^ hostname)
+    | NONE => raise InventoryError ("Host not found: " ^ host_name)
   
-  fun get_group_vars (inventory, group_name) =
-    case get_group (inventory, group_name) of
+  (* Get group variables *)
+  fun get_group_vars (inv: inventory, group_name) =
+    case get_group (inv, group_name) of
       SOME group => !(#vars group)
-    | NONE => raise InventoryError("Group not found: " ^ group_name)
+    | NONE => raise InventoryError ("Group not found: " ^ group_name)
   
-  fun set_group_var (inventory, group_name, key, value) =
-    case get_group (inventory, group_name) of
+  (* Set group variable *)
+  fun set_group_var (inv: inventory, group_name, key, value) =
+    case get_group (inv, group_name) of
       SOME group => 
         let
-          val vars = !(#vars group)
-          val vars' = (key, value) :: 
-                      List.filter (fn (k, _) => k <> key) vars
+          val current_vars = !(#vars group)
+          val new_vars = 
+            case List.find (fn (k, _) => k = key) current_vars of
+              SOME _ => 
+                map (fn (k, v) => 
+                       if k = key then 
+                         (k, value)
+                       else 
+                         (k, v))
+                    current_vars
+            | NONE => (key, value) :: current_vars
         in
-          #vars group := vars'
+          (#vars group) := new_vars
         end
-    | NONE => raise InventoryError("Group not found: " ^ group_name)
+    | NONE => raise InventoryError ("Group not found: " ^ group_name)
   
-  (* Calculate effective variables with Ansible-like precedence *)
-  fun get_effective_vars (inventory, hostname) =
+  (* Get effective variables for a host with proper precedence *)
+  fun get_effective_vars (inv: inventory, host_name) =
     let
-      (* Start with empty vars *)
-      val result = ref []
+      (* First get the host vars *)
+      val host_vars = 
+        case get_host (inv, host_name) of
+          SOME host => !(#vars host)
+        | NONE => raise InventoryError ("Host not found: " ^ host_name)
       
-      (* Helper to merge variables with precedence *)
-      fun merge_vars vars =
-        List.app (fn (k, v) => 
-          result := (k, v) :: 
-                   List.filter (fn (k', _) => k' <> k) (!result)) vars
+      (* Get all groups the host belongs to *)
+      val host_groups = get_host_groups (inv, host_name)
       
-      (* Get all groups for this host *)
-      val host_groups = get_host_groups(inventory, hostname)
+      (* Accumulate all group vars *)
+      fun collect_group_vars [] vars = vars
+        | collect_group_vars (g::gs) vars =
+            let
+              val group_vars = get_group_vars (inv, g)
+            in
+              collect_group_vars gs (vars @ group_vars)
+            end
+                
+      val all_group_vars = collect_group_vars host_groups []
       
-      (* Apply group variables in alphabetical order (Ansible behavior) *)
-      val sorted_groups = ListMergeSort.sort (fn (a, b) => a > b) host_groups
-      val _ = List.app (fn g => 
-                merge_vars (get_group_vars(inventory, g))) sorted_groups
-      
-      (* Finally apply host variables (highest precedence) *)
-      val _ = merge_vars (get_host_vars(inventory, hostname))
+      (* Combine, giving host vars precedence *)
+      fun merge_vars [] host_specific = host_specific
+        | merge_vars ((k,v)::rest) host_specific =
+            if List.exists (fn (k',_) => k = k') host_specific then
+              merge_vars rest host_specific
+            else
+              merge_vars rest ((k,v)::host_specific)
     in
-      !result
+      merge_vars all_group_vars host_vars
     end
   
-  (* Dynamic inventory support *)
-  fun add_dynamic_source (inventory, source_fn) =
-    #dynamic_sources inventory := source_fn :: !(#dynamic_sources inventory)
+  (* Add a dynamic inventory source *)
+  fun add_dynamic_source (inv: inventory, source_fn) =
+    (#dynamic_sources inv) := source_fn :: (!(#dynamic_sources inv))
   
-  fun refresh inventory =
+  (* Refresh the inventory using dynamic sources *)
+  fun refresh (inv: inventory) =
     let
-      (* Execute all dynamic sources *)
-      val sources = !(#dynamic_sources inventory)
-      
-      (* Process each source *)
       fun process_source source_fn =
         let
-          val hosts = source_fn()
+          val hosts_with_vars = source_fn()
+          
+          fun process_host (hostname, host_vars) =
+            case get_host (inv, hostname) of
+              SOME host => 
+                (* Update vars for existing host *)
+                app (fn (k, v) => set_host_var (inv, hostname, k, v)) host_vars
+            | NONE => 
+                (* Add new host *)
+                ignore(add_host (inv, hostname, host_vars))
         in
-          List.app (fn (hostname, vars) =>
-            case get_host(inventory, hostname) of
-              SOME host => #vars host := vars  (* Update existing host *)
-            | NONE => ignore (add_host(inventory, hostname, vars)))  (* Add new host *)
-          hosts
+          app process_host hosts_with_vars
         end
     in
-      List.app process_source sources
+      app process_source (!(#dynamic_sources inv))
+    end
+  
+  (* Load inventory from a file *)
+  fun load_file filename =
+    let
+      val inv = create()
+      
+      val file = TextIO.openIn filename
+            handle _ => raise InventoryError ("Cannot open inventory file: " ^ filename)
+      
+      fun read_lines current_group =
+        case TextIO.inputLine file of
+          NONE => ()
+        | SOME line => 
+            if String.size line = 0 orelse String.sub(line, 0) = #"#" then
+              (* Skip empty lines and comments *)
+              read_lines current_group
+            else if String.sub(line, 0) = #"[" then
+              (* Group definition *)
+              let
+                val group_line = string_trim line
+                val group_name = 
+                  if String.isSubstring "]" group_line then
+                    String.substring(group_line, 1, 
+                                    String.size group_line - 2)
+                  else
+                    String.substring(group_line, 1, 
+                                    String.size group_line - 1)
+              in
+                ignore(add_group (inv, group_name, []));
+                read_lines (SOME group_name)
+              end
+            else
+              (* Host or variable definition *)
+              let
+                val line_trimmed = string_trim line
+              in
+                if String.isSubstring "=" line_trimmed then
+                  (* Variable definition *)
+                  let
+                    val parts = String.tokens (fn c => c = #"=") line_trimmed
+                    val key = string_trim (hd parts)
+                    val value = string_trim (String.concatWith "=" (tl parts))
+                  in
+                    case current_group of
+                      SOME group => set_group_var (inv, group, key, value)
+                    | NONE => ();
+                    read_lines current_group
+                  end
+                else if current_group <> NONE then
+                  (* Host definition *)
+                  let
+                    val host_parts = String.tokens (fn c => c = #" " orelse c = #"\t") line_trimmed
+                    val host_name = string_trim (hd host_parts)
+                    
+                    (* Check for host vars in "hostname var1=val1 var2=val2" format *)
+                    val host_vars = ref []
+                    val _ = 
+                      app (fn part => 
+                            if String.isSubstring "=" part then
+                              let
+                                val var_parts = String.tokens (fn c => c = #"=") part
+                                val var_name = string_trim (hd var_parts)
+                                val var_value = string_trim (String.concatWith "=" (tl var_parts))
+                              in
+                                host_vars := (var_name, var_value) :: !host_vars
+                              end
+                            else ())
+                          (tl host_parts)
+                  in
+                    ignore(add_host (inv, host_name, !host_vars));
+                    add_host_to_group (inv, host_name, valOf current_group);
+                    read_lines current_group
+                  end
+                else
+                  (* Unknown line format - skip *)
+                  read_lines current_group
+              end
+    in
+      read_lines NONE;
+      TextIO.closeIn file;
+      inv
+    end
+  
+  (* Save inventory to a file *)
+  fun save_file (inv: inventory, filename) =
+    let
+      val out = TextIO.openOut filename
+               handle _ => raise InventoryError ("Cannot open output file: " ^ filename)
+      
+      (* Write all groups *)
+      val groups = list_groups inv
+      
+      fun write_group group_name =
+        let
+          val _ = TextIO.output(out, "[" ^ group_name ^ "]\n")
+          
+          (* Write hosts in this group *)
+          val hosts = get_group_hosts (inv, group_name)
+          val _ = app (fn host => TextIO.output(out, host ^ "\n")) hosts
+          
+          (* Write group vars *)
+          val vars = get_group_vars (inv, group_name)
+          val _ = app (fn (k,v) => TextIO.output(out, k ^ "=" ^ v ^ "\n")) vars
+          
+          (* Add spacing *)
+          val _ = TextIO.output(out, "\n")
+        in
+          ()
+        end
+    in
+      app write_group groups;
+      TextIO.closeOut out
     end
 end

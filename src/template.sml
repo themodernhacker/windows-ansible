@@ -91,16 +91,6 @@ structure Template : TEMPLATE = struct
       default_filter_list
     end
   
-  (* Check if a template contains a specific variable *)
-  fun has_variable (template, var_name) = 
-    let
-      val var_pattern = "{{" ^ var_name ^ "}}"
-      val stripped_var = string_trim var_name
-      val vars = extract_variables template
-    in
-      List.exists (fn v => v = stripped_var) vars
-    end
-
   (* Extract all variables from a template *)
   fun extract_variables template =
     let
@@ -108,29 +98,45 @@ structure Template : TEMPLATE = struct
         if pos >= String.size template then
           acc
         else
-          case string_findSubstring "{{" template pos of
+          case string_findSubstring "{{" template of
             NONE => acc
           | SOME start_idx =>
-              case string_findSubstring "}}" template (start_idx + 2) of
-                NONE => acc
-              | SOME end_idx => 
-                  let
-                    val var_expr = String.substring(template, start_idx + 2, end_idx - start_idx - 2)
-                    val var_name = 
-                      case String.tokens (fn c => c = #"|") var_expr of
-                        [] => ""
-                      | name::_ => string_trim name
-                    val new_pos = end_idx + 2
-                  in
-                    if var_name = "" orelse List.exists (fn v => v = var_name) acc then
-                      extract acc new_pos
+              if start_idx < pos then 
+                extract acc (pos + 1)
+              else
+                case string_findSubstring "}}" template of
+                  NONE => acc
+                | SOME end_idx => 
+                    if end_idx <= start_idx + 2 then
+                      extract acc (end_idx + 2)
                     else
-                      extract (var_name :: acc) new_pos
-                  end
+                      let
+                        val var_expr = String.substring(template, start_idx + 2, end_idx - start_idx - 2)
+                        val var_name = 
+                          case String.tokens (fn c => c = #"|") var_expr of
+                            [] => ""
+                          | name::_ => string_trim name
+                        val new_pos = end_idx + 2
+                      in
+                        if var_name = "" orelse List.exists (fn v => v = var_name) acc then
+                          extract acc new_pos
+                        else
+                          extract (var_name :: acc) new_pos
+                      end
     in
       extract [] 0
     end
 
+  (* Check if a template contains a specific variable *)
+  fun has_variable (template, var_name) = 
+    let
+      val var_pattern = "{{" ^ var_name ^ "}}"
+      val stripped_var = string_trim var_name
+      val template_vars = extract_variables template
+    in
+      List.exists (fn v => v = stripped_var) template_vars
+    end
+  
   (* Helper function to get a variable value *)
   fun lookup_var vars name =
     case List.find (fn (k, _) => k = name) vars of
