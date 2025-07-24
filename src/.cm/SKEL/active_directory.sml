@@ -1,2 +1,2 @@
 Skeleton 5
-d2f4d"List"d"OS"d"TextIO"d"String"ad"ActiveDirectory"jh0gp1c"ACTIVE_DIRECTORY"
+d2f6d"List"Cd"Char"d"OS"d"Int"d"TextIO"d"String"Nad"ActiveDirectory"jh0gp1c"ACTIVE_DIRECTORY"
