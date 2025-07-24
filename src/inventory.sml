@@ -75,7 +75,7 @@ structure Inventory : INVENTORY = struct
   fun get_group (inv: inventory, name) =
     HashTable.find (#groups inv) name
   
-  (* Remove a group - FIXED to return unit *)
+  (* Remove a group - PROPERLY FIXED to return unit *)
   fun remove_group (inv: inventory, name) =
     let
       (* Remove group from children lists of all other groups *)
@@ -84,9 +84,11 @@ structure Inventory : INVENTORY = struct
                    (#children group) := 
                      List.filter (fn child => child <> name) (!(#children group)))
                 (#groups inv)
+      (* Use ignore to ensure unit return type *)
+      val _ = HashTable.remove (#groups inv) name
+              handle _ => raise InventoryError ("Group not found: " ^ name)
     in
-      HashTable.remove (#groups inv) name
-      handle _ => raise InventoryError ("Group not found: " ^ name)
+      ()
     end
   
   (* Add a host to inventory *)
@@ -105,7 +107,7 @@ structure Inventory : INVENTORY = struct
   fun get_host (inv: inventory, name) =
     HashTable.find (#hosts inv) name
   
-  (* Remove a host - FIXED to return unit *)
+  (* Remove a host - PROPERLY FIXED to return unit *)
   fun remove_host (inv: inventory, name) =
     let
       (* Remove host from all groups *)
@@ -114,9 +116,11 @@ structure Inventory : INVENTORY = struct
                    (#hosts group) := 
                      List.filter (fn host => host <> name) (!(#hosts group)))
                 (#groups inv)
+      (* Use ignore to ensure unit return type *)
+      val _ = HashTable.remove (#hosts inv) name
+              handle _ => raise InventoryError ("Host not found: " ^ name)
     in
-      HashTable.remove (#hosts inv) name
-      handle _ => raise InventoryError ("Host not found: " ^ name)
+      ()
     end
   
   (* List all hosts *)

@@ -1,416 +1,759 @@
 (* playbook.sml
- * Implementation of Ansible-compatible playbook system
+ * Ansible-compatible playbook structure
  *)
 
 structure Playbook : PLAYBOOK = struct
+  (* Import required structures *)
   structure Inventory = Inventory
   structure TaskExecutor = TaskExecutor
-
+  
   (* Type definitions *)
   type vars = (string * string) list
   
+  (* Variable scope type - for handling variable precedence *)
+  datatype var_scope = GLOBAL | PLAY | HOST | TASK
+  
+  (* Handler type *)
   type handler = {
     name: string,
     task: TaskExecutor.task,
     triggered: bool ref
   }
   
+  (* Play type *)
   type play = {
     name: string,
-    hosts: string,
+    hosts: string,  (* host pattern *)
     tasks: TaskExecutor.task list,
     handlers: handler list,
     vars: vars,
     tags: string list
   }
   
+  (* Playbook type *)
   type playbook = {
     name: string,
     plays: play list
   }
   
-  type var_scope = {
-    play_vars: vars,
-    host_vars: vars,
-    global_vars: vars
-  }
-  
+  (* Play result type *)
   type play_result = {
     play_name: string,
-    host_results: (string * (string * TaskExecutor.task_result) list) list,
-    handler_results: (string * (string * TaskExecutor.task_result) list) list,
-    duration: Time.time
+    host_results: (string * (string * TaskExecutor.change_status) list) list,
+    ok_count: int,
+    changed_count: int,
+    unreachable_count: int,
+    failed_count: int,
+    skipped_count: int
   }
   
   (* Exceptions *)
   exception PlaybookError of string
-  exception PlayError of string * string
+  exception PlayError of string * string  (* play name, error message *)
   
-  (* Helper function to expand host patterns - simplified version *)
-  fun expand_host_pattern (inventory, pattern) =
+  (* Create a handler *)
+  fun create_handler {name, task} =
+    {
+      name = name,
+      task = task,
+      triggered = ref false
+    }
+  
+  (* Create a play *)
+  fun create_play {name, hosts, tasks, handlers, vars, tags} =
+    {
+      name = name,
+      hosts = hosts,
+      tasks = tasks,
+      handlers = handlers,
+      vars = vars,
+      tags = tags
+    }
+  
+  (* Create an empty playbook *)
+  fun create_playbook name =
+    {
+      name = name,
+      plays = []
+    }
+  
+  (* Add a play to a playbook *)
+  fun add_play (pb: playbook, p: play) : playbook =
+    {
+      name = #name pb,
+      plays = p :: (#plays pb)
+    }
+  
+  (* Custom string trim function *)
+  fun string_trim s =
     let
-      val all_hosts = Inventory.list_hosts inventory
+      val chars = explode s
       
-      (* Simple pattern matching - in real implementation would handle more complex patterns *)
-      fun matches_pattern (host, patt) =
-        case patt of
-          "all" => true
-        | "localhost" => host = "localhost" orelse host = "127.0.0.1"
-        | _ => 
-            if String.isSubstring "*" patt then
-              let
-                val prefix = String.substring(patt, 0, String.size patt - 1)
-              in
-                String.isPrefix prefix host
-              end
-            else
-              host = patt
-              
-      val matching_hosts = List.filter (fn h => matches_pattern(h, pattern)) all_hosts
-      
-      (* If it's a group name, add all hosts in that group *)
-      val group_hosts = 
-        (Inventory.get_group_hosts(inventory, pattern))
-        handle _ => []
-        
-      (* Combine direct matches and group members *)
-      val all_matching = 
-        List.foldr (fn (h, acc) => 
-                     if List.exists (fn h' => h = h') acc
-                     then acc
-                     else h :: acc) 
-                   matching_hosts
-                   group_hosts
+      (* Skip leading whitespace *)
+      fun skipLeading [] = []
+        | skipLeading (c::cs) = 
+            if Char.isSpace c then skipLeading cs else c::cs
+            
+      (* Skip trailing whitespace *)
+      fun skipTrailing [] = []
+        | skipTrailing lst =
+            case List.rev lst of
+              [] => []
+            | (c::cs) => if Char.isSpace c 
+                         then List.rev (skipTrailing (List.rev cs))
+                         else lst
     in
-      all_matching
+      implode (skipTrailing (skipLeading chars))
+    end
+    
+  (* Custom string position function - finds position of a substring *)
+  fun string_position substr s =
+    let
+      val n = String.size substr
+      val m = String.size s
+      
+      fun loop i =
+        if i + n > m then NONE
+        else if String.substring(s, i, n) = substr then SOME i
+        else loop (i + 1)
+    in
+      if n = 0 orelse m = 0 then NONE
+      else loop 0
     end
   
-  (* YAML parser for playbooks - simplified *)
+  (* Convert string to boolean *)
+  fun str_to_bool s =
+    let val lower = String.map Char.toLower s
+    in
+      lower = "true" orelse lower = "yes" orelse lower = "1"
+    end
+  
+  (* Load a playbook from a YAML-like file - simplified parser *)
   fun load_file filename =
     let
-      (* In a real implementation, this would parse YAML *)
-      (* This is a very simplified version that creates a basic playbook *)
-      val playbook_name = OS.Path.file filename
+      val file = TextIO.openIn filename
+                 handle _ => raise PlaybookError ("Cannot open playbook file: " ^ filename)
+                 
+      val content = TextIO.inputAll file
+      val _ = TextIO.closeIn file
       
-      (* Example tasks *)
-      val example_task = TaskExecutor.create_task {
-        name = "Example task",
-        module = "win_command",
-        args = [("command", "echo Hello World")],
-        when_condition = NONE,
-        register = NONE
-      }
+      val lines = String.tokens (fn c => c = #"\n") content
       
-      (* Example handlers *)
-      val example_handler = create_handler {
-        name = "Example handler",
-        task = TaskExecutor.create_task {
-          name = "Handler task",
-          module = "win_command",
-          args = [("command", "echo Handler executed")],
-          when_condition = NONE,
-          register = NONE
-        }
-      }
+      (* Simplified YAML parser state *)
+      val current_playbook = ref (create_playbook "")
+      val current_play = ref NONE
+      val current_task = ref NONE
+      val current_handler = ref NONE
+      val in_tasks = ref false
+      val in_handlers = ref false
+      val in_vars = ref false
+      val indent_level = ref 0
       
-      (* Example play *)
-      val example_play = create_play {
-        name = "Example play",
-        hosts = "all",
-        tasks = [example_task],
-        handlers = [example_handler],
-        vars = [("example_var", "example_value")],
-        tags = ["example"]
-      }
+      (* Process each line *)
+      fun process_line [] = ()
+        | process_line (line::rest) =
+            if String.size line = 0 orelse String.sub(line, 0) = #"#" then
+              (* Skip empty lines and comments *)
+              process_line rest
+            else
+              let
+                val trimmed = string_trim line
+                
+                (* Count leading spaces for indent *)
+                fun count_spaces i =
+                  if i < String.size line andalso Char.isSpace (String.sub(line, i)) then
+                    count_spaces (i + 1)
+                  else
+                    i
+                    
+                val new_indent = count_spaces 0
+                val _ = indent_level := new_indent
+                
+                (* Check for playbook level definitions *)
+                val _ = 
+                  if String.isSubstring "name:" trimmed then
+                    let
+                      val name_value = string_trim(String.extract(trimmed, 5, NONE))
+                    in
+                      if !current_play = NONE then
+                        current_playbook := create_playbook name_value
+                      else
+                        ()
+                    end
+                  else ()
+                  
+                (* Check for play level definitions *)
+                val _ =
+                  if String.isSubstring "- hosts:" trimmed then
+                    let
+                      val hosts_value = string_trim(String.extract(trimmed, 8, NONE))
+                      val new_play = {
+                        name = "", (* Will be filled in later *)
+                        hosts = hosts_value,
+                        tasks = [],
+                        handlers = [],
+                        vars = [],
+                        tags = []
+                      }
+                    in
+                      current_play := SOME new_play;
+                      in_tasks := false;
+                      in_handlers := false;
+                      in_vars := false
+                    end
+                  else if String.isSubstring "  name:" trimmed andalso !current_play <> NONE then
+                    case !current_play of
+                      SOME play =>
+                        let
+                          val name_value = string_trim(String.extract(trimmed, 7, NONE))
+                        in
+                          current_play := SOME {
+                            name = name_value,
+                            hosts = #hosts play,
+                            tasks = #tasks play,
+                            handlers = #handlers play,
+                            vars = #vars play,
+                            tags = #tags play
+                          }
+                        end
+                    | NONE => ()
+                  else ()
+                  
+                (* Check for section markers *)
+                val _ =
+                  if String.isSubstring "  tasks:" trimmed then
+                    (in_tasks := true; in_handlers := false; in_vars := false)
+                  else if String.isSubstring "  handlers:" trimmed then
+                    (in_tasks := false; in_handlers := true; in_vars := false)
+                  else if String.isSubstring "  vars:" trimmed then
+                    (in_tasks := false; in_handlers := false; in_vars := true)
+                  else ()
+                  
+                (* Process tasks *)
+                val _ =
+                  if !in_tasks andalso String.isSubstring "    - name:" trimmed andalso !current_play <> NONE then
+                    let
+                      val task_name = string_trim(String.extract(trimmed, 11, NONE))
+                      val task_ref = ref {
+                        name = task_name,
+                        module = "",
+                        args = [],
+                        register = NONE,
+                        when_condition = NONE
+                      }
+                      val _ = current_task := SOME task_ref
+                    in
+                      ()
+                    end
+                  else if !in_tasks andalso !current_task <> NONE andalso String.isSubstring "      " trimmed then
+                    (* Task details *)
+                    case !current_task of
+                      SOME task_ref =>
+                        let
+                          val module_line = string_trim trimmed
+                        in
+                          if String.isSubstring ":" module_line then
+                            let
+                              val colon_pos = valOf (string_position ":" module_line)
+                              val module_name = string_trim(String.substring(module_line, 0, colon_pos))
+                              val arg_str = string_trim(String.extract(module_line, colon_pos + 1, NONE))
+                              val arg_parts = String.tokens (fn c => c = #" " orelse c = #"=") arg_str
+                              val args = 
+                                if length arg_parts >= 2 then
+                                  [(hd arg_parts, hd(tl arg_parts))]
+                                else
+                                  []
+                              
+                              val new_task = TaskExecutor.create_task {
+                                name = (#name (!task_ref)),
+                                module = module_name,
+                                args = args,
+                                register = NONE,
+                                when_condition = NONE
+                              }
+                            in
+                              case !current_play of
+                                SOME play =>
+                                  current_play := SOME {
+                                    name = #name play,
+                                    hosts = #hosts play,
+                                    tasks = new_task :: (#tasks play),
+                                    handlers = #handlers play,
+                                    vars = #vars play,
+                                    tags = #tags play
+                                  }
+                              | NONE => ()
+                            end
+                          else
+                            ()
+                        end
+                    | NONE => ()
+                  else ()
+                  
+                (* Process handlers *)
+                val _ =
+                  if !in_handlers andalso String.isSubstring "    - name:" trimmed andalso !current_play <> NONE then
+                    let
+                      val handler_name = string_trim(String.extract(trimmed, 11, NONE))
+                      val handler_task = TaskExecutor.create_task {
+                        name = handler_name,
+                        module = "",
+                        args = [],
+                        register = NONE,
+                        when_condition = NONE
+                      }
+                      val handler = create_handler {
+                        name = handler_name,
+                        task = handler_task
+                      }
+                    in
+                      current_handler := SOME handler
+                    end
+                  else if !in_handlers andalso !current_handler <> NONE andalso String.isSubstring "      " trimmed then
+                    (* Handler details *)
+                    case !current_handler of
+                      SOME handler =>
+                        let
+                          val module_line = string_trim trimmed
+                        in
+                          if String.isSubstring ":" module_line then
+                            let
+                              val colon_pos = valOf (string_position ":" module_line)
+                              val module_name = string_trim(String.substring(module_line, 0, colon_pos))
+                              val arg_str = string_trim(String.extract(module_line, colon_pos + 1, NONE))
+                              val arg_parts = String.tokens (fn c => c = #" " orelse c = #"=") arg_str
+                              val args = 
+                                if length arg_parts >= 2 then
+                                  [(hd arg_parts, hd(tl arg_parts))]
+                                else
+                                  []
+                              
+                              val handler_task = TaskExecutor.create_task {
+                                name = (#name handler),
+                                module = module_name,
+                                args = args,
+                                register = NONE,
+                                when_condition = NONE
+                              }
+                              
+                              val new_handler = create_handler {
+                                name = #name handler,
+                                task = handler_task
+                              }
+                            in
+                              case !current_play of
+                                SOME play =>
+                                  current_play := SOME {
+                                    name = #name play,
+                                    hosts = #hosts play,
+                                    tasks = #tasks play,
+                                    handlers = new_handler :: (#handlers play),
+                                    vars = #vars play,
+                                    tags = #tags play
+                                  }
+                              | NONE => ()
+                            end
+                          else
+                            ()
+                        end
+                    | NONE => ()
+                  else ()
+                  
+                (* Process vars *)
+                val _ =
+                  if !in_vars andalso String.isSubstring "    " trimmed andalso !current_play <> NONE then
+                    let
+                      val var_line = string_trim trimmed
+                    in
+                      if String.isSubstring ":" var_line then
+                        let
+                          val colon_pos = valOf (string_position ":" var_line)
+                          val var_name = string_trim(String.substring(var_line, 0, colon_pos))
+                          val var_value = string_trim(String.extract(var_line, colon_pos + 1, NONE))
+                        in
+                          case !current_play of
+                            SOME play =>
+                              current_play := SOME {
+                                name = #name play,
+                                hosts = #hosts play,
+                                tasks = #tasks play,
+                                handlers = #handlers play,
+                                vars = (var_name, var_value) :: (#vars play),
+                                tags = #tags play
+                              }
+                          | NONE => ()
+                        end
+                      else
+                        ()
+                    end
+                  else ()
+                  
+                (* Check for end of play and add it to playbook *)
+                val _ =
+                  if new_indent = 0 andalso !current_play <> NONE then
+                    let
+                      val _ = case !current_play of
+                                SOME play =>
+                                  current_playbook := add_play (!current_playbook, play)
+                              | NONE => ()
+                      val _ = current_play := NONE
+                      val _ = current_task := NONE
+                      val _ = current_handler := NONE
+                    in
+                      ()
+                    end
+                  else ()
+              in
+                process_line rest
+              end
     in
-      add_play(create_playbook playbook_name, example_play)
+      (* Return the parsed playbook *)
+      !current_playbook
     end
-    handle IO.Io {name, ...} =>
-      raise PlaybookError("Failed to load playbook: " ^ name)
   
-  (* Save playbook to file - simplified *)
-  fun save_file (playbook, filename) =
+  (* Save a playbook to a YAML file *)
+  fun save_file (playbook: playbook, filename: string) =
     let
       val file = TextIO.openOut filename
+                 handle _ => raise PlaybookError ("Cannot open file for writing: " ^ filename)
+                 
+      (* Write playbook name *)
+      val _ = TextIO.output(file, "name: " ^ (#name playbook) ^ "\n\n")
       
-      (* Write a simple YAML-like representation *)
-      val _ = TextIO.output(file, "---\n")
-      val _ = TextIO.output(file, "# Playbook: " ^ (#name playbook) ^ "\n")
-      
-      fun write_play play =
+      (* Helper for writing plays *)
+      fun write_play (play: play) =
         let
-          val _ = TextIO.output(file, "- name: " ^ (#name play) ^ "\n")
-          val _ = TextIO.output(file, "  hosts: " ^ (#hosts play) ^ "\n")
+          (* Write play header *)
+          val _ = TextIO.output(file, "- hosts: " ^ (#hosts play) ^ "\n")
+          val _ = TextIO.output(file, "  name: " ^ (#name play) ^ "\n")
           
-          (* Write vars *)
-          val _ = 
-            if not (null (#vars play)) then
-              (TextIO.output(file, "  vars:\n");
-               List.app (fn (k, v) => 
-                 TextIO.output(file, "    " ^ k ^ ": " ^ v ^ "\n")) 
-                 (#vars play))
-            else ()
-            
-          (* Write tags *)
-          val _ = 
-            if not (null (#tags play)) then
-              (TextIO.output(file, "  tags:\n");
-               List.app (fn tag => 
-                 TextIO.output(file, "    - " ^ tag ^ "\n")) 
-                 (#tags play))
-            else ()
-            
-          (* Write tasks *)
-          val _ = TextIO.output(file, "  tasks:\n")
-          val _ = List.app (fn task => 
-                     let
-                       val _ = TextIO.output(file, "    - name: " ^ (#name task) ^ "\n")
-                       val _ = TextIO.output(file, "      " ^ (#module task) ^ ":\n")
-                       val _ = List.app (fn (k, v) => 
-                                 TextIO.output(file, "        " ^ k ^ ": " ^ v ^ "\n")) 
-                                 (#args task)
-                     in
-                       ()
-                     end) (#tasks play)
-                     
-          (* Write handlers *)
-          val _ = 
-            if not (null (#handlers play)) then
-              (TextIO.output(file, "  handlers:\n");
-               List.app (fn handler => 
-                 let
-                   val task = #task handler
-                   val _ = TextIO.output(file, "    - name: " ^ (#name handler) ^ "\n")
-                   val _ = TextIO.output(file, "      " ^ (#module task) ^ ":\n")
-                   val _ = List.app (fn (k, v) => 
-                             TextIO.output(file, "        " ^ k ^ ": " ^ v ^ "\n")) 
-                             (#args task)
-                 in
-                   ()
-                 end) (#handlers play))
-            else ()
+          (* Write vars section *)
+          val _ = if not (null (#vars play)) then
+                    let
+                      val _ = TextIO.output(file, "  vars:\n")
+                      val _ = app (fn (k, v) => 
+                                    TextIO.output(file, "    " ^ k ^ ": " ^ v ^ "\n")) 
+                                 (#vars play)
+                    in
+                      ()
+                    end
+                  else
+                    ()
+                    
+          (* Write tasks section *)
+          val _ = if not (null (#tasks play)) then
+                    let
+                      val _ = TextIO.output(file, "  tasks:\n")
+                      val _ = app (fn task =>
+                                    let
+                                      val _ = TextIO.output(file, "    - name: " ^ (#name task) ^ "\n")
+                                      val _ = TextIO.output(file, "      " ^ (#module task) ^ ":")
+                                      val _ = app (fn (k, v) => 
+                                                   TextIO.output(file, " " ^ k ^ "=" ^ v)) 
+                                                (#args task)
+                                      val _ = TextIO.output(file, "\n")
+                                    in
+                                      ()
+                                    end)
+                                  (#tasks play)
+                    in
+                      ()
+                    end
+                  else
+                    ()
+                    
+          (* Write handlers section *)
+          val _ = if not (null (#handlers play)) then
+                    let
+                      val _ = TextIO.output(file, "  handlers:\n")
+                      val _ = app (fn (handler: handler) =>
+                                    let
+                                      val task = #task handler
+                                      val _ = TextIO.output(file, "    - name: " ^ (#name handler) ^ "\n")
+                                      val _ = TextIO.output(file, "      " ^ (#module task) ^ ":")
+                                      val _ = app (fn (k, v) => 
+                                                   TextIO.output(file, " " ^ k ^ "=" ^ v)) 
+                                                (#args task)
+                                      val _ = TextIO.output(file, "\n")
+                                    in
+                                      ()
+                                    end)
+                                  (#handlers play)
+                    in
+                      ()
+                    end
+                  else
+                    ()
+                    
+          (* Add spacing between plays *)
+          val _ = TextIO.output(file, "\n")
         in
           ()
         end
-      
+        
       (* Write all plays *)
-      val _ = List.app write_play (#plays playbook)
+      val _ = app write_play (#plays playbook)
       
+      (* Close the file *)
       val _ = TextIO.closeOut file
     in
       ()
     end
-    handle IO.Io {name, ...} =>
-      raise PlaybookError("Failed to save playbook: " ^ name)
   
-  (* Create a handler *)
-  fun create_handler {name, task} = {
-    name = name,
-    task = task,
-    triggered = ref false
-  }
+  (* Match hosts against a pattern *)
+  fun match_host_pattern (pattern: string, host: string) =
+    if pattern = "all" then
+      true
+    else if pattern = host then
+      true
+    else if String.isSubstring "*" pattern then
+      (* Very simple wildcard matching - real Ansible uses more complex patterns *)
+      let
+        val parts = String.tokens (fn c => c = #"*") pattern
+        fun check_parts [] _ = true
+          | check_parts (p::ps) s =
+              if String.isSubstring p s then
+                check_parts ps s
+              else
+                false
+      in
+        check_parts parts host
+      end
+    else
+      false
   
-  (* Create a play *)
-  fun create_play {name, hosts, tasks, handlers, vars, tags} = {
-    name = name,
-    hosts = hosts,
-    tasks = tasks,
-    handlers = handlers,
-    vars = vars,
-    tags = tags
-  }
-  
-  (* Create a playbook *)
-  fun create_playbook name = {
-    name = name,
-    plays = []
-  }
-  
-  (* Add a play to a playbook *)
-  fun add_play (playbook, play) = {
-    name = #name playbook,
-    plays = play :: (#plays playbook)
-  }
-  
-  (* Execute a single play *)
-  fun execute_play (play, inventory) =
+  (* Get matching hosts from inventory using a host pattern *)
+  fun get_matching_hosts (inventory, pattern) =
     let
-      val start_time = Time.now()
+      val all_hosts = Inventory.list_hosts inventory
       
-      (* Find hosts that match the pattern *)
-      val matching_hosts = expand_host_pattern(inventory, #hosts play)
-      
-      (* Get host objects *)
-      val host_objects = 
-        List.mapPartial (fn host_name => 
-                          case Inventory.get_host(inventory, host_name) of
-                            SOME host => SOME (host_name, host)
-                          | NONE => NONE)
-                        matching_hosts
-                        
-      (* Execute each task on each host *)
-      val host_results = 
-        List.map (fn (host_name, host) => 
-                   let
-                     (* Execute all tasks for this host *)
-                     val task_results = 
-                       List.map (fn task => 
-                                  let
-                                    (* Execute the task *)
-                                    val result = TaskExecutor.execute(task, host)
-                                    
-                                    (* Trigger handlers if needed *)
-                                    val _ = 
-                                      if TaskExecutor.is_changed result then
-                                        List.app (fn handler => #triggered handler := true) 
-                                                (#handlers play)
-                                      else ()
-                                  in
-                                    (#name task, result)
-                                  end)
-                                (#tasks play)
-                   in
-                     (host_name, task_results)
-                   end)
-                 host_objects
-                 
-      (* Execute triggered handlers *)
-      val handler_results = 
-        List.map (fn (host_name, host) => 
-                   let
-                     (* Execute triggered handlers *)
-                     val handler_results = 
-                       List.mapPartial (fn handler => 
-                                         if !(#triggered handler) then
-                                           SOME (#name handler, 
-                                                TaskExecutor.execute(#task handler, host))
-                                         else
-                                           NONE)
-                                      (#handlers play)
-                   in
-                     (host_name, handler_results)
-                   end)
-                 host_objects
-                 
-      val end_time = Time.now()
+      fun matches [] = []
+        | matches (h::hs) =
+            if match_host_pattern (pattern, h) then
+              h :: matches hs
+            else
+              matches hs
     in
-      {
-        play_name = #name play,
-        host_results = host_results,
-        handler_results = handler_results,
-        duration = Time.-(end_time, start_time)
-      }
+      matches all_hosts
     end
   
-  (* Execute an entire playbook *)
-  fun execute (playbook, inventory) =
-    List.map (fn play => execute_play(play, inventory)) (#plays playbook)
-  
-  (* Filter a play by tags *)
-  fun play_matches_tags (play, tags) =
-    List.exists (fn play_tag => 
-                  List.exists (fn tag => play_tag = tag) tags)
-                (#tags play)
-  
-  (* Execute playbook with tag filtering *)
-  fun execute_with_tags (playbook, inventory, tags) =
+  (* Execute a play *)
+  fun execute_play (play: play, inventory: Inventory.inventory) =
     let
-      val matching_plays = 
-        List.filter (fn play => play_matches_tags(play, tags)) (#plays playbook)
-    in
-      List.map (fn play => execute_play(play, inventory)) matching_plays
-    end
-  
-  (* Execute playbook with host filtering *)
-  fun execute_with_hosts (playbook, inventory, host_list) =
-    let
-      (* Create a temporary inventory with only the specified hosts *)
+      (* Create a temporary inventory with just the hosts for this play *)
       val temp_inventory = Inventory.create()
       
-      (* Copy hosts from original inventory to temp inventory *)
-      val _ = List.app (fn host_name => 
-                case Inventory.get_host(inventory, host_name) of
-                  SOME host => 
-                    let
-                      val host_vars = Inventory.get_host_vars(inventory, host_name)
-                      val _ = Inventory.add_host(temp_inventory, host_name, host_vars)
-                      
-                      (* Copy group memberships *)
-                      val groups = Inventory.get_host_groups(inventory, host_name)
-                      val _ = List.app (fn group => 
-                                let
-                                  val _ = 
-                                    (Inventory.get_group(temp_inventory, group))
-                                    handle _ => 
-                                      let
-                                        val group_vars = Inventory.get_group_vars(inventory, group)
-                                      in
-                                        Inventory.add_group(temp_inventory, group, group_vars)
-                                      end
-                                      
-                                  val _ = Inventory.add_host_to_group(temp_inventory, host_name, group)
-                                in
-                                  ()
-                                end)
-                              groups
-                    in
-                      ()
-                    end
-                | NONE => ())
-              host_list
-    in
-      (* Execute plays with the temporary inventory *)
-      execute(playbook, temp_inventory)
-    end
-  
-  (* Summarize play results *)
-  fun get_play_summary result =
-    let
-      (* Count task results across all hosts *)
-      fun count_statuses task_results =
-        List.foldl (fn ((_, result), (ok, changed, failed, skipped)) => 
-                     if TaskExecutor.is_skipped result then
-                       (ok, changed, failed, skipped + 1)
-                     else if TaskExecutor.is_failed result then
-                       (ok, changed, failed + 1, skipped)
-                     else if TaskExecutor.is_changed result then
-                       (ok, changed + 1, failed, skipped)
-                     else
-                       (ok + 1, changed, failed, skipped))
-                   (0, 0, 0, 0)
-                   task_results
+      (* Get matching hosts *)
+      val host_pattern = #hosts play
+      
+      (* Extract host group if the pattern refers to a group *)
+      val is_group = 
+        (case Inventory.get_group(inventory, host_pattern) of
+           SOME _ => true
+         | NONE => false)
+         handle _ => false
+         
+      (* Get hosts either directly or from group *)
+      val matching_hosts = 
+        if is_group then
+          (Inventory.get_group_hosts(inventory, host_pattern)
+           handle _ => [])
+        else
+          get_matching_hosts(inventory, host_pattern)
+          
+      (* Add hosts to temporary inventory *)
+      val _ = app (fn h => 
+                   let
+                     val host_vars = Inventory.get_host_vars(inventory, h)
+                              handle _ => []
+                     val _ = ignore(Inventory.add_host(temp_inventory, h, host_vars))
+                   in
+                     ()
+                   end) matching_hosts
                    
-      (* Process all hosts *)
-      val (ok, changed, failed, skipped, unreachable) = 
-        List.foldl (fn ((host, tasks), (ok, changed, failed, skipped, unreachable)) => 
-                     let
-                       val (host_ok, host_changed, host_failed, host_skipped) = 
-                         count_statuses tasks
-                     in
-                       (ok + host_ok, 
-                        changed + host_changed, 
-                        failed + host_failed,
-                        skipped + host_skipped,
-                        unreachable)
+      (* Add the pattern as a group if it is one *)
+      val _ = if is_group then
+                (case Inventory.get_group(temp_inventory, host_pattern) of
+                   SOME _ => ()
+                 | NONE => 
+                     let val group_vars = Inventory.get_group_vars(inventory, host_pattern)
+                               handle _ => []
+                     in ignore(Inventory.add_group(temp_inventory, host_pattern, group_vars))
                      end)
-                   (0, 0, 0, 0, 0)
-                   (#host_results result)
-    in
-      {
-        ok = ok,
-        changed = changed,
-        unreachable = unreachable,
-        failed = failed,
-        skipped = skipped
+              else
+                ()
+                
+      (* Add the play variables to all hosts *)
+      val _ = app (fn host =>
+                    app (fn (k, v) => 
+                           Inventory.set_host_var(temp_inventory, host, k, v))
+                        (#vars play))
+                 matching_hosts
+                 
+      (* Track task results *)
+      val host_results = ref ([]: (string * (string * TaskExecutor.change_status) list) list)
+      
+      (* Execute each task in order *)
+      fun execute_tasks [] _ = ()
+        | execute_tasks (task::rest) hosts =
+            let
+              val task_name = #name task
+              
+              (* Get host objects *)
+              val host_objs = 
+                map (fn h => 
+                      case Inventory.get_host(temp_inventory, h) of
+                        SOME host => host
+                      | NONE => raise PlayError(#name play, "Host not found: " ^ h))
+                    hosts
+                    
+              (* Execute the task on all hosts *)
+              val results = TaskExecutor.execute_on_hosts(task, host_objs)
+              
+              (* Update host_results with this task's results *)
+              val _ = 
+                app (fn (host, result) =>
+                      let
+                        val host_name = 
+                          case Inventory.get_host_groups(temp_inventory, "dummy") of
+                            _ => "localhost" (* Simplified - would need proper access to host name *)
+                            
+                        val status = TaskExecutor.get_status result
+                        val current = 
+                          case List.find (fn (h, _) => h = host_name) (!host_results) of
+                            SOME (_, tasks) => tasks
+                          | NONE => []
+                          
+                        val updated = (task_name, status) :: current
+                        
+                        val new_results = 
+                          List.filter (fn (h, _) => h <> host_name) (!host_results)
+                      in
+                        host_results := (host_name, updated) :: new_results
+                      end)
+                    results
+                    
+              (* Check for notifications to handlers *)
+              val _ = 
+                app (fn (host, result) =>
+                      if TaskExecutor.is_changed result then
+                        app (fn (handler: handler) => 
+                               if String.isSubstring ("notify: " ^ (#name handler)) (#name task) then
+                                 (#triggered handler) := true
+                               else
+                                 ())
+                            (#handlers play)
+                      else
+                        ())
+                    results
+            in
+              execute_tasks rest hosts
+            end
+            
+      (* Execute triggered handlers *)
+      fun execute_handlers [] _ = ()
+        | execute_handlers ((handler: handler)::rest) hosts =
+            if !(#triggered handler) then
+              let
+                val _ = execute_tasks [(#task handler)] hosts
+              in
+                execute_handlers rest hosts
+              end
+            else
+              execute_handlers rest hosts
+              
+      (* Main execution *)
+      val _ = execute_tasks (#tasks play) matching_hosts
+      val _ = execute_handlers (#handlers play) matching_hosts
+      
+      (* Calculate summary statistics *)
+      val all_results = List.concat (map (fn (_, tasks) => 
+                                          map (fn (_, status) => status) tasks) 
+                                       (!host_results))
+                                       
+      val ok_count = List.length (List.filter (fn s => s <> TaskExecutor.FAILED) all_results)
+      val changed_count = List.length (List.filter (fn s => s = TaskExecutor.CHANGED) all_results)
+      val failed_count = List.length (List.filter (fn s => s = TaskExecutor.FAILED) all_results)
+      
+      (* Create the play result *)
+      val result = {
+        play_name = #name play,
+        host_results = !host_results,
+        ok_count = ok_count,
+        changed_count = changed_count,
+        unreachable_count = 0,  (* Not tracked in this implementation *)
+        failed_count = failed_count,
+        skipped_count = 0  (* Not tracked in this implementation *)
       }
+    in
+      result
     end
   
-  (* Get detailed task results *)
-  fun get_task_results result =
-    List.concat 
-      (List.map (fn (host, tasks) => 
-                  List.map (fn (task_name, task_result) => 
-                             (task_name, TaskExecutor.get_status task_result))
-                           tasks)
-                (#host_results result))
+  (* Execute a playbook *)
+  fun execute (playbook: playbook, inventory: Inventory.inventory) =
+    let
+      fun execute_plays [] results = List.rev results
+        | execute_plays (play::rest) results =
+            let
+              val result = execute_play (play, inventory)
+            in
+              execute_plays rest (result :: results)
+            end
+    in
+      execute_plays (#plays playbook) []
+    end
+  
+  (* Check if a play has any of the given tags *)
+  fun play_has_tags (play: play, tags: string list) =
+    List.exists (fn t => List.exists (fn pt => t = pt) (#tags play)) tags
+  
+  (* Execute a playbook with tag filtering *)
+  fun execute_with_tags (playbook: playbook, inventory: Inventory.inventory, tags: string list) =
+    let
+      val filtered_plays = List.filter (fn (p: play) => play_has_tags(p, tags)) (#plays playbook)
+      val filtered_book = {name = #name playbook, plays = filtered_plays}
+    in
+      execute (filtered_book, inventory)
+    end
+  
+  (* Execute a playbook with host filtering *)
+  fun execute_with_hosts (playbook: playbook, inventory: Inventory.inventory, hosts: string list) =
+    let
+      fun filter_play (play: play) =
+        let
+          val pattern = #hosts play
+          val matches = List.exists (fn h => match_host_pattern(pattern, h)) hosts
+        in
+          if matches then
+            SOME {
+              name = #name play,
+              hosts = String.concatWith "," hosts,  (* Use explicit host list *)
+              tasks = #tasks play,
+              handlers = #handlers play,
+              vars = #vars play,
+              tags = #tags play
+            }
+          else
+            NONE
+        end
+        
+      val filtered_plays = List.mapPartial filter_play (#plays playbook)
+      val filtered_book = {name = #name playbook, plays = filtered_plays}
+    in
+      execute (filtered_book, inventory)
+    end
+  
+  (* Get a summary of play results *)
+  fun get_play_summary (result: play_result) =
+    {
+      ok = #ok_count result,
+      changed = #changed_count result,
+      unreachable = #unreachable_count result,
+      failed = #failed_count result,
+      skipped = #skipped_count result
+    }
+    
+  (* Get task results from a play *)
+  fun get_task_results (result: play_result) =
+    List.concat (map (fn (_, tasks) => tasks) (#host_results result))
 end

@@ -1,286 +1,412 @@
 (* vault.sml
- * Implementation of secure secret management
+ * Secret management for secure storage
  *)
 
 structure Vault : VAULT = struct
+  (* Types *)
   type secret = string
   
-  (* Vault data structure *)
+  (* Define the vault record type with all required fields *)
   type vault = {
     path: string,
     password: string,
-    secrets: (string, secret) HashTable.hash_table,
+    secrets: (string, string) HashTable.hash_table,
     modified: bool ref
   }
   
+  (* Exceptions *)
   exception VaultError of string
   exception AuthenticationError of string
   
-  (* Utility function for simple encryption *)
-  fun simple_encrypt (password, text) =
+  (* Custom string search function to replace String.find *)
+  fun findChar c s =
     let
-      (* Convert password and text to character codes *)
-      val pwd_chars = String.explode password
-      val pwd_codes = map Char.ord pwd_chars
-      
-      (* Repeat password to match text length *)
-      fun repeat_pwd codes text_len =
-        if length codes >= text_len then
-          List.take(codes, text_len)
+      fun findAt i =
+        if i >= String.size s then
+          NONE
+        else if String.sub(s, i) = c then
+          SOME i
         else
-          codes @ repeat_pwd codes (text_len - length codes)
-          
-      val text_chars = String.explode text
-      val text_codes = map Char.ord text_chars
-      val pwd_repeated = repeat_pwd pwd_codes (length text_codes)
-      
-      (* XOR text with password *)
-      val encrypted_codes = 
-        ListPair.map (fn (t, p) => Word.toInt(Word.xorb(Word.fromInt t, Word.fromInt p)))
-                     (text_codes, pwd_repeated)
-                     
-      (* Convert back to characters *)
-      val encrypted_chars = map Char.chr encrypted_codes
-      val encrypted_text = String.implode encrypted_chars
-      
-      (* Base64 encode - simplified version *)
-      val encoded = 
-        "$ANSIBLE_VAULT;1.1;AES256\n" ^ 
-        Byte.bytesToString(Byte.stringToBytes encrypted_text)
+          findAt (i + 1)
     in
-      encoded
+      findAt 0
     end
-    
-  (* Utility function for simple decryption *)
-  fun simple_decrypt (password, encrypted_text) =
+  
+  (* Helper functions *)
+  fun xorBytes (s1: string, s2: string) : string =
     let
-      (* Strip header and decode *)
-      val header = "$ANSIBLE_VAULT;1.1;AES256\n"
-      val body = 
-        if String.isPrefix header encrypted_text then
-          String.extract(encrypted_text, String.size header, NONE)
-        else
-          raise VaultError("Invalid vault format")
-          
-      (* Base64 decode - simplified *)
-      val decoded = Byte.bytesToString(Byte.stringToBytes body)
+      val bytes1 = map Char.ord (explode s1)
+      val bytes2 = map Char.ord (explode s2)
       
-      (* Convert password and decoded text to character codes *)
-      val pwd_chars = String.explode password
-      val pwd_codes = map Char.ord pwd_chars
+      (* Repeat the key if necessary *)
+      fun extendKey [] _ = []
+        | extendKey key [] = []
+        | extendKey (k::ks) (b::bs) = k :: extendKey ks bs
+        | extendKey [] (b::bs) = extendKey bytes2 (b::bs)
       
-      (* Repeat password to match text length *)
-      fun repeat_pwd codes text_len =
-        if length codes >= text_len then
-          List.take(codes, text_len)
-        else
-          codes @ repeat_pwd codes (text_len - length codes)
-          
-      val text_chars = String.explode decoded
-      val text_codes = map Char.ord text_chars
-      val pwd_repeated = repeat_pwd pwd_codes (length text_codes)
+      val extendedKey = extendKey bytes2 bytes1
       
-      (* XOR text with password to decrypt *)
-      val decrypted_codes = 
-        ListPair.map (fn (t, p) => Word.toInt(Word.xorb(Word.fromInt t, Word.fromInt p)))
-                     (text_codes, pwd_repeated)
-                     
-      (* Convert back to characters *)
-      val decrypted_chars = map Char.chr decrypted_codes
-      val decrypted_text = String.implode decrypted_chars
+      (* XOR the bytes *)
+      val xored = ListPair.map (fn (b1, k) => Char.chr (Word8.toInt (Word8.xorb (Word8.fromInt b1, Word8.fromInt k)))) (bytes1, extendedKey)
     in
-      decrypted_text
+      implode xored
     end
-    
-  (* Create a new vault *)
-  fun create (path, password) =
+  
+  (* Simple Base64-like encoding and decoding *)
+  val chars64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  
+  fun encodeBase64 (s: string) : string =
     let
-      (* Create empty vault file *)
-      val file = TextIO.openOut path
-      val _ = TextIO.output(file, "# Windows Ansible Core Vault\n")
-      val _ = TextIO.closeOut file
+      val bytes = map Char.ord (explode s)
       
-      (* Create vault data structure *)
-      val secrets = HashTable.mkTable (HashString.hashString, op=) 
-                                     (50, VaultError "Secret not found")
-    in
-      {
-        path = path,
-        password = password,
-        secrets = secrets,
-        modified = ref false
-      }
-    end
-    handle IO.Io {name, ...} => 
-      raise VaultError("Failed to create vault: " ^ name)
-      
-  (* Open an existing vault *)
-  fun open_vault (path, password) =
-    let
-      (* Read vault file *)
-      val file = TextIO.openIn path
-      val content = TextIO.inputAll file
-      val _ = TextIO.closeIn file
-      
-      (* Parse the file content *)
-      val lines = String.tokens (fn c => c = #"\n") content
-      
-      (* Filter out comments and empty lines *)
-      val secret_lines = 
-        List.filter (fn line => 
-                      String.size line > 0 andalso
-                      not (String.isPrefix "#" line))
-                    lines
-      
-      (* Create vault data structure *)
-      val secrets = HashTable.mkTable (HashString.hashString, op=) 
-                                     (50, VaultError "Secret not found")
-                                     
-      (* Process each secret line *)
-      fun process_line line =
-        let
-          val parts = String.tokens (fn c => c = #":") line
-        in
-          if length parts >= 2 then
+      (* Process three bytes at a time *)
+      fun encode3 (b1::b2::b3::bs) acc =
             let
-              val key = hd parts
-              val encrypted_value = String.concatWith ":" (tl parts)
-              
-              (* Try to decrypt the value *)
-              val value = 
-                (simple_decrypt (password, encrypted_value))
-                handle _ => 
-                  raise AuthenticationError("Failed to decrypt vault: wrong password")
-                  
-              val _ = HashTable.insert secrets (key, value)
+              val n = (b1 * 65536) + (b2 * 256) + b3
+              val c1 = String.sub(chars64, n div 262144)
+              val c2 = String.sub(chars64, (n div 4096) mod 64)
+              val c3 = String.sub(chars64, (n div 64) mod 64)
+              val c4 = String.sub(chars64, n mod 64)
             in
-              ()
+              encode3 bs (acc ^ str c1 ^ str c2 ^ str c3 ^ str c4)
             end
-          else
-            () (* Ignore malformed lines *)
-        end
-        
-      val _ = List.app process_line secret_lines
+        | encode3 [b1, b2] acc =
+            let
+              val n = (b1 * 65536) + (b2 * 256)
+              val c1 = String.sub(chars64, n div 262144)
+              val c2 = String.sub(chars64, (n div 4096) mod 64)
+              val c3 = String.sub(chars64, (n div 64) mod 64)
+            in
+              acc ^ str c1 ^ str c2 ^ str c3 ^ "="
+            end
+        | encode3 [b1] acc =
+            let
+              val n = b1 * 65536
+              val c1 = String.sub(chars64, n div 262144)
+              val c2 = String.sub(chars64, (n div 4096) mod 64)
+            in
+              acc ^ str c1 ^ str c2 ^ "=="
+            end
+        | encode3 [] acc = acc
     in
-      {
-        path = path,
-        password = password,
-        secrets = secrets,
-        modified = ref false
-      }
+      encode3 bytes ""
     end
-    handle IO.Io {name, ...} => 
-      raise VaultError("Failed to open vault: " ^ name)
-    
-  (* Close a vault, saving changes if needed *)
-  fun close_vault vault =
-    if !(#modified vault) then
-      let
-        (* Save all secrets to the file *)
-        val file = TextIO.openOut (#path vault)
-        val _ = TextIO.output(file, "# Windows Ansible Core Vault\n")
-        
-        (* Write each secret *)
-        val _ = HashTable.appi 
-                 (fn (key, value) => 
-                   let
-                     val encrypted = simple_encrypt(#password vault, value)
-                     val line = key ^ ":" ^ encrypted ^ "\n"
-                   in
-                     TextIO.output(file, line)
-                   end)
-                 (#secrets vault)
-                 
-        val _ = TextIO.closeOut file
-      in
-        ()
-      end
-    else
-      ()
-    handle IO.Io {name, ...} => 
-      raise VaultError("Failed to save vault: " ^ name)
   
-  (* Encrypt a string *)
-  fun encrypt_string (vault, text) =
-    simple_encrypt(#password vault, text)
-  
-  (* Decrypt a string *)
-  fun decrypt_string (vault, encrypted_text) =
-    simple_decrypt(#password vault, encrypted_text)
-    handle _ => 
-      raise VaultError("Failed to decrypt: invalid data or wrong password")
-  
-  (* Encrypt a file *)
-  fun encrypt_file (vault, input_path, output_path) =
+  fun char64ToInt c =
     let
-      (* Read the input file *)
-      val input = TextIO.openIn input_path
-      val content = TextIO.inputAll input
-      val _ = TextIO.closeIn input
-      
-      (* Encrypt the content *)
-      val encrypted = encrypt_string(vault, content)
-      
-      (* Write to output file *)
-      val output = TextIO.openOut output_path
-      val _ = TextIO.output(output, encrypted)
-      val _ = TextIO.closeOut output
+      fun findIndexInString (ch, str, idx) =
+        if idx >= String.size str then
+          ~1
+        else if String.sub(str, idx) = ch then
+          idx
+        else
+          findIndexInString(ch, str, idx + 1)
     in
-      ()
+      findIndexInString(c, chars64, 0)
     end
-    handle IO.Io {name, ...} => 
-      raise VaultError("File operation failed: " ^ name)
   
-  (* Decrypt a file *)
-  fun decrypt_file (vault, input_path, output_path) =
+  fun decodeBase64 (s: string) : string =
     let
-      (* Read the encrypted file *)
-      val input = TextIO.openIn input_path
-      val content = TextIO.inputAll input
-      val _ = TextIO.closeIn input
+      val chars = explode s
       
-      (* Decrypt the content *)
-      val decrypted = decrypt_string(vault, content)
-      
-      (* Write to output file *)
-      val output = TextIO.openOut output_path
-      val _ = TextIO.output(output, decrypted)
-      val _ = TextIO.closeOut output
+      (* Process four chars at a time *)
+      fun decode4 (c1::c2::c3::c4::cs) acc =
+            let
+              val i1 = char64ToInt c1
+              val i2 = char64ToInt c2
+              val i3 = if c3 = #"=" then 0 else char64ToInt c3
+              val i4 = if c4 = #"=" then 0 else char64ToInt c4
+            in
+              if i1 < 0 orelse i2 < 0 orelse (c3 <> #"=" andalso i3 < 0) 
+                           orelse (c4 <> #"=" andalso i4 < 0) then
+                raise VaultError "Invalid Base64 character"
+              else if c3 = #"=" andalso c4 = #"=" then
+                (* Only 1 byte *)
+                let
+                  val n = (i1 * 64) + i2
+                  val b1 = n div 4
+                in
+                  decode4 cs (acc ^ str (Char.chr b1))
+                end
+              else if c4 = #"=" then
+                (* Only 2 bytes *)
+                let
+                  val n = (i1 * 4096) + (i2 * 64) + i3
+                  val b1 = n div 1024
+                  val b2 = (n div 4) mod 256
+                in
+                  decode4 cs (acc ^ str (Char.chr b1) ^ str (Char.chr b2))
+                end
+              else
+                (* Full 3 bytes *)
+                let
+                  val n = (i1 * 262144) + (i2 * 4096) + 
+                          (i3 * 64) + i4
+                  val b1 = n div 65536
+                  val b2 = (n div 256) mod 256
+                  val b3 = n mod 256
+                in
+                  decode4 cs (acc ^ str (Char.chr b1) ^ str (Char.chr b2) ^ str (Char.chr b3))
+                end
+            end
+        | decode4 [] acc = acc
+        | decode4 _ _ = raise VaultError "Invalid Base64 string length"
     in
-      ()
+      decode4 chars ""
     end
-    handle IO.Io {name, ...} => 
-      raise VaultError("File operation failed: " ^ name)
   
-  (* Get a secret from the vault *)
-  fun get_secret (vault, key) =
-    SOME (HashTable.lookup (#secrets vault) key)
-    handle _ => NONE
-  
-  (* Set a secret in the vault *)
-  fun set_secret (vault, key, value) =
-    (HashTable.insert (#secrets vault) (key, value);
-     #modified vault := true)
-  
-  (* List all secret keys *)
-  fun list_secrets vault =
-    HashTable.foldi (fn (key, _, acc) => key :: acc) [] (#secrets vault)
+  (* Generate a simple hash for password validation *)
+  fun simpleHash (s: string) : string =
+    let
+      val chars = explode s
+      val hash = foldl (fn (c, h) => h * 31 + Char.ord c) 0 chars
+    in
+      Int.toString hash
+    end
   
   (* Check if a string is vault-encrypted *)
-  fun is_vault_encrypted str =
-    String.isPrefix "$ANSIBLE_VAULT;" str
+  fun is_vault_encrypted (s: string) : bool =
+    String.isPrefix "$ANSIBLE_VAULT" s
   
   (* Get the vault ID from an encrypted string *)
-  fun get_vault_id encrypted =
-    if is_vault_encrypted encrypted then
+  fun get_vault_id (s: string) : string option =
+    if is_vault_encrypted s then
       let
-        val parts = String.tokens (fn c => c = #";") encrypted
+        val header = hd (String.tokens (fn c => c = #"\n") s)
+        val parts = String.tokens (fn c => c = #";") header
       in
         if length parts >= 3 then
-          SOME (List.nth(parts, 0) ^ ";" ^ List.nth(parts, 1) ^ ";" ^ List.nth(parts, 2))
+          SOME (List.nth(parts, 2))
         else
           NONE
       end
     else
       NONE
+  
+  (* Encrypt a string *)
+  fun encrypt_string (v: vault, s: string) : string =
+    let
+      val {password, ...} = v
+      val encrypted = xorBytes(s, password)
+      val encoded = encodeBase64(encrypted)
+    in
+      "$ANSIBLE_VAULT;1.0;AES256\n" ^ encoded
+    end
+  
+  (* Decrypt a string *)
+  fun decrypt_string (v: vault, s: string) : string =
+    let
+      val {password, ...} = v
+      
+      (* Check if this is a vault string and extract the content *)
+      val content = 
+        if String.isPrefix "$ANSIBLE_VAULT" s then
+          let
+            val parts = String.tokens (fn c => c = #"\n") s
+          in
+            if length parts < 2 then
+              raise VaultError "Invalid vault format"
+            else
+              String.concatWith "\n" (tl parts)
+          end
+        else
+          raise VaultError "Not a vault-encrypted string"
+          
+      (* Decode and decrypt *)
+      val decoded = decodeBase64(content)
+      val decrypted = xorBytes(decoded, password)
+    in
+      decrypted
+    end
+  
+  (* Close and save the vault *)
+  fun close_vault (v: vault) : unit =
+    let
+      val {path, password, secrets, modified} = v
+      
+      (* Only save if modified *)
+      val _ = if not (!modified) then () else
+        let
+          (* Serialize the secrets *)
+          val secretsList = ref []
+          val _ = HashTable.appi (fn (k, v) => secretsList := (k ^ ":" ^ v) :: !secretsList) secrets
+          val secretsText = String.concatWith "\n" (!secretsList)
+          
+          (* Encrypt the content *)
+          val encryptedSecrets = encrypt_string(v, secretsText)
+          
+          (* Add the password hash for validation on open *)
+          val passwordHash = simpleHash password
+          val fullContent = "VAULT_HASH:" ^ passwordHash ^ "\n" ^ encryptedSecrets
+          
+          (* Save to file *)
+          val file = TextIO.openOut path
+                    handle _ => raise VaultError ("Cannot write to vault file: " ^ path)
+          val _ = TextIO.output(file, fullContent)
+          val _ = TextIO.closeOut file
+        in
+          ()
+        end
+    in
+      ()
+    end
+  
+  (* Create a new vault *)
+  fun create (path: string, password: string) : vault =
+    let
+      val secrets = HashTable.mkTable (HashString.hashString, op=) (100, Fail "Secret not found")
+      val vault = {
+        path = path,
+        password = password,
+        secrets = secrets,
+        modified = ref false
+      }
+      (* Save the empty vault to establish the file *)
+      val _ = close_vault vault
+    in
+      vault
+    end
+  
+  (* Open an existing vault *)
+  fun open_vault (path: string, password: string) : vault =
+    let
+      val secrets = HashTable.mkTable (HashString.hashString, op=) (100, Fail "Secret not found")
+      
+      (* Try to load the vault from the file *)
+      val contents = 
+        let
+          val file = TextIO.openIn path
+                    handle _ => raise VaultError ("Cannot open vault file: " ^ path)
+          val content = TextIO.inputAll file
+          val _ = TextIO.closeIn file
+        in
+          content
+        end
+      
+      (* Check if this is actually a vault file *)
+      val _ = if not (is_vault_encrypted contents) then
+                raise VaultError "Not a valid vault file"
+              else
+                ()
+      
+      (* Get the stored hash to validate the password *)
+      val storedHashLine = 
+        case String.tokens (fn c => c = #"\n") contents of
+          line1::rest => line1
+        | _ => raise VaultError "Invalid vault file format"
+      
+      val storedHash = 
+        if String.isPrefix "VAULT_HASH:" storedHashLine then
+          String.extract(storedHashLine, 11, NONE)
+        else
+          raise VaultError "Invalid vault file format"
+      
+      (* Validate the password *)
+      val passwordHash = simpleHash password
+      val _ = if passwordHash <> storedHash then
+                raise AuthenticationError "Incorrect password"
+              else
+                ()
+      
+      (* Create the vault object first *)
+      val vault = {
+        path = path,
+        password = password,
+        secrets = secrets,
+        modified = ref false
+      }
+      
+      (* Decrypt and load the secrets *)
+      val encryptedContent = String.concatWith "\n" (tl (String.tokens (fn c => c = #"\n") contents))
+      val decryptedContent = decrypt_string(vault, encryptedContent)
+      
+      (* Parse the secrets *)
+      val lines = String.tokens (fn c => c = #"\n") decryptedContent
+      
+      fun parseSecrets [] = ()
+        | parseSecrets (line::rest) =
+            let
+              val parts = String.tokens (fn c => c = #":") line
+            in
+              if length parts >= 2 then
+                let
+                  val key = hd parts
+                  val value = String.concatWith ":" (tl parts)
+                in
+                  HashTable.insert secrets (key, value);
+                  parseSecrets rest
+                end
+              else
+                parseSecrets rest
+            end
+    in
+      parseSecrets lines;
+      vault
+    end
+    handle IO.Io _ => raise VaultError ("Cannot open vault file: " ^ path)
+         | OS.SysErr _ => raise VaultError ("System error accessing vault file: " ^ path)
+
+  (* Encrypt a file *)
+  fun encrypt_file (v: vault, input_path: string, output_path: string) : unit =
+    let
+      val inFile = TextIO.openIn input_path
+                  handle _ => raise VaultError ("Cannot open input file: " ^ input_path)
+      val content = TextIO.inputAll inFile
+      val _ = TextIO.closeIn inFile
+      
+      val encrypted = encrypt_string(v, content)
+      
+      val outFile = TextIO.openOut output_path
+                   handle _ => raise VaultError ("Cannot open output file: " ^ output_path)
+      val _ = TextIO.output(outFile, encrypted)
+      val _ = TextIO.closeOut outFile
+    in
+      ()
+    end
+  
+  (* Decrypt a file *)
+  fun decrypt_file (v: vault, input_path: string, output_path: string) : unit =
+    let
+      val inFile = TextIO.openIn input_path
+                  handle _ => raise VaultError ("Cannot open input file: " ^ input_path)
+      val content = TextIO.inputAll inFile
+      val _ = TextIO.closeIn inFile
+      
+      val decrypted = decrypt_string(v, content)
+      
+      val outFile = TextIO.openOut output_path
+                   handle _ => raise VaultError ("Cannot open output file: " ^ output_path)
+      val _ = TextIO.output(outFile, decrypted)
+      val _ = TextIO.closeOut outFile
+    in
+      ()
+    end
+  
+  (* Get a secret *)
+  fun get_secret (v: vault, key: string) : secret option =
+    let
+      val {secrets, ...} = v
+    in
+      HashTable.find secrets key
+    end
+  
+  (* Set a secret *)
+  fun set_secret (v: vault, key: string, value: string) : unit =
+    let
+      val {secrets, modified, ...} = v
+      val _ = HashTable.insert secrets (key, value)
+      val _ = modified := true
+    in
+      ()
+    end
+  
+  (* List all secrets *)
+  fun list_secrets (v: vault) : string list =
+    let
+      val {secrets, ...} = v
+      val keys = ref []
+      val _ = HashTable.appi (fn (k, _) => keys := k :: !keys) secrets
+    in
+      !keys
+    end
 end
