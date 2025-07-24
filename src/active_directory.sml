@@ -144,22 +144,20 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
         "}"
         
       val (rc, stdout, stderr) = execute_powershell test_cmd
+      
+      (* Update current connection *)
+      val new_connection = {
+        server = server,
+        port = port,
+        use_ssl = use_ssl,
+        domain = domain,
+        username = username,
+        connected = rc = 0 andalso String.isSubstring "Connection successful" stdout
+      }
     in
-      if rc = 0 andalso String.isSubstring "Connection successful" stdout then
-        (* Update current connection *)
-        let
-          val new_connection = {
-            server = server,
-            port = port,
-            use_ssl = use_ssl,
-            domain = domain,
-            username = username,
-            connected = true
-          }
-        in
-          current_connection := new_connection;
-          ()
-        end
+      current_connection := new_connection;
+      if #connected new_connection then
+        new_connection
       else
         raise ADError (
           if stderr = "" then 
@@ -188,11 +186,11 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
       }
     in
       current_connection := new_connection;
-      ()
+      new_connection
     end
   
   (* Disconnect *)
-  fun disconnect () = (current_connection := default_connection)
+  fun disconnect conn = (current_connection := default_connection)
   
   (* Object type string conversion *)
   fun object_type_to_string USER = "user"
@@ -460,6 +458,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     in
       if rc <> 0 then
         raise ADError ("Failed to delete object: " ^ stderr)
+      else
+        ()
     end
   
   (* Move AD object *)
@@ -491,40 +491,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
       if rc <> 0 then
         raise ADError ("Failed to move object: " ^ stderr)
       else
-        (* Parse result lines to create ad_object *)
-        let
-          val result_lines = String.tokens (fn c => c = #"\n" orelse c = #"\r") stdout
-          
-          val dn_line = 
-            case List.find (fn l => String.isPrefix "DN=" l) result_lines of
-              SOME l => string_trim (String.extract(l, 3, NONE))
-            | NONE => raise ADError "Invalid object format: no DN found"
-              
-          val class_line = 
-            case List.find (fn l => String.isPrefix "ObjectClass=" l) result_lines of
-              SOME l => string_trim (String.extract(l, 12, NONE))
-            | NONE => #object_class obj
-              
-          (* Parse properties *)
-          fun parse_prop line =
-            case String.tokens (fn c => c = #"=") line of
-              name::value::_ => (string_trim name, string_trim value)
-            | _ => ("unknown", line)
-              
-          val props = 
-            List.filter (fn l => String.isSubstring "=" l andalso 
-                                not (String.isPrefix "DN=" l) andalso
-                                not (String.isPrefix "ObjectClass=" l))
-                        result_lines
-          val properties = map parse_prop props
-        in
-          {
-            distinguished_name = dn_line,
-            object_class = class_line,
-            object_type = #object_type obj,
-            properties = properties
-          }
-        end
+        ()
     end
   
   (* Add user/computer to group *)
@@ -550,6 +517,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     in
       if rc <> 0 then
         raise ADError ("Failed to add to group: " ^ stderr)
+      else
+        ()
     end
   
   (* Remove from group *)
@@ -575,6 +544,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     in
       if rc <> 0 then
         raise ADError ("Failed to remove from group: " ^ stderr)
+      else
+        ()
     end
   
   (* Check if member of group *)
@@ -682,7 +653,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
           (* Parse properties *)
           fun parse_prop line =
             case String.tokens (fn c => c = #"=") line of
-              name::value::_ => (string_trim name, string_trim value)
+              [name, value] => (string_trim name, string_trim value)
+            | name::value::_ => (string_trim name, string_trim value)
             | _ => ("unknown", line)
               
           val props = 
@@ -707,7 +679,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Property management *)
-  fun get_property obj property_name =
+  fun get_property (obj, property_name) =
     let
       val properties = #properties obj
     in
@@ -737,14 +709,25 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     in
       if rc <> 0 then
         raise ADError ("Failed to set property: " ^ stderr)
+      else
+        ()
     end
   
   (* Get all properties *)
   fun get_properties obj = #properties obj
   
   (* Find objects *)
-  fun find_objects (conn, base_dn, filter) =
+  fun find_objects (conn, base_dn, obj_type) =
     let
+      (* Build filter based on object type *)
+      val filter =
+        case obj_type of
+          ANY => "(objectClass=*)"
+        | USER => "(objectClass=user)"
+        | GROUP => "(objectClass=group)"
+        | COMPUTER => "(objectClass=computer)"
+        | OU => "(objectClass=organizationalUnit)"
+      
       (* Build search command *)
       val search_cmd = 
         "try {" ^
@@ -814,7 +797,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
             | NONE => "unknown"
               
           (* Determine object type from class *)
-          val obj_type = 
+          val determined_type = 
             if String.isSubstring "user" class_line then USER
             else if String.isSubstring "group" class_line then GROUP
             else if String.isSubstring "computer" class_line then COMPUTER
@@ -824,7 +807,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
           (* Parse properties *)
           fun parse_prop line =
             case String.tokens (fn c => c = #"=") line of
-              name::value::_ => (string_trim name, string_trim value)
+              [name, value] => (string_trim name, string_trim value)
+            | name::value::_ => (string_trim name, string_trim value)
             | _ => ("unknown", line)
               
           val props = 
@@ -837,7 +821,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
           {
             distinguished_name = dn_line,
             object_class = class_line,
-            object_type = obj_type,
+            object_type = determined_type,
             properties = properties
           }
         end
@@ -849,26 +833,36 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
     end
   
   (* Find users *)
-  fun find_users (conn, base_dn, name_filter) =
+  fun find_users (conn, name_filter) =
     let
+      (* Determine base DN from domain *)
+      val domain_parts = String.tokens (fn c => c = #".") (#domain (!current_connection))
+      val base_dn = String.concatWith "," (map (fn part => "DC=" ^ part) domain_parts)
+      
+      (* Build filter *)
       val filter = 
         if name_filter = "" then
           "(objectClass=user)"
         else
           "(&(objectClass=user)(cn=*" ^ name_filter ^ "*))"
     in
-      find_objects (conn, base_dn, filter)
+      find_objects (conn, base_dn, USER)
     end
   
   (* Find groups *)
-  fun find_groups (conn, base_dn, name_filter) =
+  fun find_groups (conn, name_filter) =
     let
+      (* Determine base DN from domain *)
+      val domain_parts = String.tokens (fn c => c = #".") (#domain (!current_connection))
+      val base_dn = String.concatWith "," (map (fn part => "DC=" ^ part) domain_parts)
+      
+      (* Build filter *)
       val filter = 
         if name_filter = "" then
           "(objectClass=group)"
         else
           "(&(objectClass=group)(cn=*" ^ name_filter ^ "*))"
     in
-      find_objects (conn, base_dn, filter)
+      find_objects (conn, base_dn, GROUP)
     end
 end
