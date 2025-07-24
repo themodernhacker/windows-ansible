@@ -295,8 +295,9 @@ structure WindowsModule : WINDOWS_MODULE = struct
       fun create_backup () =
         if backup andalso dest_exists then
           let
+            (* FIXED: Added IntInf.toInt conversion *)
             val backup_path = dest ^ "." ^ 
-                             Int.toString(Time.toSeconds(Time.now())) ^ ".bak"
+                             Int.toString(IntInf.toInt(Time.toSeconds(Time.now()))) ^ ".bak"
             val cmd = "Copy-Item -Path '" ^ dest ^ "' -Destination '" ^ backup_path ^ "' -Force"
             val (rc, _, stderr) = execute_powershell cmd
             
@@ -1189,17 +1190,232 @@ structure WindowsModule : WINDOWS_MODULE = struct
         msg = SOME (exnMessage e),
         results = []
       }
-  
+
+  (* Helper functions to convert between arg types for module dispatch *)
+  (* Convert generic args list to command_args record *)
+  fun convert_to_command_args args =
+    let
+      val command = 
+        case List.find (fn (k, _) => k = "command") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: command")
+        
+      val chdir = 
+        case List.find (fn (k, _) => k = "chdir") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val creates = 
+        case List.find (fn (k, _) => k = "creates") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val removes = 
+        case List.find (fn (k, _) => k = "removes") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+    in
+      {command = command, chdir = chdir, creates = creates, removes = removes}
+    end
+
+  (* Convert generic args list to file_args record *)
+  fun convert_to_file_args args =
+    let
+      val path = 
+        case List.find (fn (k, _) => k = "path") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: path")
+        
+      val state = 
+        case List.find (fn (k, _) => k = "state") args of
+          SOME (_, v) => v
+        | NONE => "file" (* default *)
+        
+      val recurse = 
+        case List.find (fn (k, _) => k = "recurse") args of
+          SOME (_, "true") => true
+        | _ => false
+        
+      val force = 
+        case List.find (fn (k, _) => k = "force") args of
+          SOME (_, "true") => true
+        | _ => false
+    in
+      {path = path, state = state, recurse = recurse, force = force}
+    end
+
+  (* Convert generic args list to copy_args record *)
+  fun convert_to_copy_args args =
+    let
+      val dest = 
+        case List.find (fn (k, _) => k = "dest") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: dest")
+        
+      val src = 
+        case List.find (fn (k, _) => k = "src") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val content = 
+        case List.find (fn (k, _) => k = "content") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val backup = 
+        case List.find (fn (k, _) => k = "backup") args of
+          SOME (_, "true") => true
+        | _ => false
+        
+      val force = 
+        case List.find (fn (k, _) => k = "force") args of
+          SOME (_, "true") => true
+        | _ => false
+    in
+      {src = src, content = content, dest = dest, backup = backup, force = force}
+    end
+
+  (* Convert generic args list to service_args record *)
+  fun convert_to_service_args args =
+    let
+      val name = 
+        case List.find (fn (k, _) => k = "name") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: name")
+        
+      val state = 
+        case List.find (fn (k, _) => k = "state") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val startup = 
+        case List.find (fn (k, _) => k = "startup") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+    in
+      {name = name, state = state, startup = startup}
+    end
+
+  (* Convert generic args list to feature_args record *)
+  fun convert_to_feature_args args =
+    let
+      val name = 
+        case List.find (fn (k, _) => k = "name") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: name")
+        
+      val state = 
+        case List.find (fn (k, _) => k = "state") args of
+          SOME (_, v) => v
+        | NONE => "present" (* default *)
+    in
+      {name = name, state = state}
+    end
+
+  (* Convert generic args list to regedit_args record *)
+  fun convert_to_regedit_args args =
+    let
+      val path = 
+        case List.find (fn (k, _) => k = "path") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: path")
+        
+      val name = 
+        case List.find (fn (k, _) => k = "name") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val data = 
+        case List.find (fn (k, _) => k = "data") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val type_str = 
+        case List.find (fn (k, _) => k = "type") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val state = 
+        case List.find (fn (k, _) => k = "state") args of
+          SOME (_, v) => v
+        | NONE => "present" (* default *)
+    in
+      {path = path, name = name, data = data, type_str = type_str, state = state}
+    end
+
+  (* Convert generic args list to acl_args record *)
+  fun convert_to_acl_args args =
+    let
+      val path = 
+        case List.find (fn (k, _) => k = "path") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: path")
+        
+      val user = 
+        case List.find (fn (k, _) => k = "user") args of
+          SOME (_, v) => v
+        | NONE => raise ArgumentError("Missing required argument: user")
+        
+      val rights = 
+        case List.find (fn (k, _) => k = "rights") args of
+          SOME (_, v) => v
+        | NONE => "ReadAndExecute" (* default *)
+        
+      val type_str = 
+        case List.find (fn (k, _) => k = "type") args of
+          SOME (_, v) => v
+        | NONE => "allow" (* default *)
+        
+      val inherit_flags = 
+        case List.find (fn (k, _) => k = "inherit_flags") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+    in
+      {path = path, user = user, rights = rights, type_str = type_str, inherit_flags = inherit_flags}
+    end
+
+  (* Convert generic args list to updates_args record *)
+  fun convert_to_updates_args args =
+    let
+      val categories = 
+        case List.find (fn (k, _) => k = "category_names") args of
+          SOME (_, v) => SOME (String.tokens (fn c => c = #",") v)
+        | NONE => NONE
+        
+      val log_path = 
+        case List.find (fn (k, _) => k = "log_path") args of
+          SOME (_, v) => SOME v
+        | NONE => NONE
+        
+      val state = 
+        case List.find (fn (k, _) => k = "state") args of
+          SOME (_, v) => v
+        | NONE => "searched" (* default *)
+    in
+      {category_names = categories, log_path = log_path, state = state}
+    end
+
   (* Function to dispatch to the appropriate module *)
   fun run_module module_name args =
     case module_name of
-      "win_command" => run_win_command args
-    | "win_file" => run_win_file args
-    | "win_copy" => run_win_copy args
-    | "win_service" => run_win_service args
-    | "win_feature" => run_win_feature args
-    | "win_regedit" => run_win_regedit args
-    | "win_acl" => run_win_acl args
-    | "win_updates" => run_win_updates args
+      "win_command" => run_win_command (convert_to_command_args args)
+    | "win_file" => run_win_file (convert_to_file_args args)
+    | "win_copy" => run_win_copy (convert_to_copy_args args)
+    | "win_service" => run_win_service (convert_to_service_args args)
+    | "win_feature" => run_win_feature (convert_to_feature_args args)
+    | "win_regedit" => run_win_regedit (convert_to_regedit_args args)
+    | "win_acl" => run_win_acl (convert_to_acl_args args)
+    | "win_updates" => run_win_updates (convert_to_updates_args args)
     | _ => raise ModuleError("Unknown module: " ^ module_name)
+    
+  (* Export convenience functions to match the signature *)
+  val win_command = run_win_command
+  val win_copy = run_win_copy
+  val win_shell = run_win_command  (* Shell is the same as command for Windows *)
+  val win_service = run_win_service
+  val win_regedit = run_win_regedit
+  val win_feature = run_win_feature
+  val win_file = run_win_file
+  val win_acl = run_win_acl
+  val win_updates = run_win_updates
 end
