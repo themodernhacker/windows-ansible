@@ -1,0 +1,47 @@
+---
+# Variables demonstration playbook
+
+- name: Windows Configuration with Variables
+  hosts: windows
+  vars:
+    app_name: TestApp
+    app_version: 1.2.3
+    install_path: C:\Program Files\{{ app_name }}
+    log_path: C:\Logs\{{ app_name }}
+    features:
+      - feature1
+      - feature2
+      - feature3
+      
+  tasks:
+    - name: Create installation directory
+      win_file:
+        path: "{{ install_path }}"
+        state: directory
+        
+    - name: Create log directory
+      win_file:
+        path: "{{ log_path }}"
+        state: directory
+        
+    - name: Create version file
+      win_copy:
+        content: "{{ app_name }} version {{ app_version }}\n"
+        dest: "{{ install_path }}\\version.txt"
+        
+    - name: Register application in registry
+      win_regedit:
+        path: HKLM:\SOFTWARE\{{ app_name }}
+        name: InstallPath
+        data: "{{ install_path }}"
+        type: string
+        state: present
+        
+    - name: Configure features
+      win_regedit:
+        path: HKLM:\SOFTWARE\{{ app_name }}\Features\{{ item }}
+        name: Enabled
+        data: 1
+        type: dword
+        state: present
+      loop: "{{ features }}"

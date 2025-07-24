@@ -1,0 +1,23 @@
+---
+# Simple Windows configuration playbook
+
+- name: Windows Server Configuration
+  hosts: windows
+  tasks:
+    - name: Ensure temp directory exists
+      win_file:
+        path: C:\Temp\WAC
+        state: directory
+        
+    - name: Create test file
+      win_copy:
+        content: "Windows Ansible Core test file\nCreated on {{ ansible_date_time.date }}\n"
+        dest: C:\Temp\WAC\test.txt
+        
+    - name: Set registry key
+      win_regedit:
+        path: HKLM:\SOFTWARE\WAC
+        name: Version
+        data: 1.0.0
+        type: string
+        state: present
