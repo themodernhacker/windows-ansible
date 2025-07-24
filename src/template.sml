@@ -1,209 +1,301 @@
 (* template.sml
- * Implementation of Ansible-like templating system
+ * Template processing for Windows Ansible Core
  *)
 
 structure Template : TEMPLATE = struct
-  (* Variable resolution *)
+  (* Type definitions *)
   type vars = (string * string) list
   
   (* Exceptions *)
   exception TemplateError of string
   exception UndefinedVariable of string
   
-  (* Filter registry *)
-  val filter_registry : (string, string -> string) HashTable.hash_table =
-    HashTable.mkTable (HashString.hashString, op=) (20, Fail "Filter not found")
+  (* Custom implementations of missing String functions *)
+  fun string_trim s =
+    let
+      val chars = explode s
+      
+      (* Skip leading whitespace *)
+      fun skipLeading [] = []
+        | skipLeading (c::cs) = 
+            if Char.isSpace c then skipLeading cs else c::cs
+            
+      (* Skip trailing whitespace *)
+      fun skipTrailing [] = []
+        | skipTrailing lst =
+            case List.rev lst of
+              [] => []
+            | (c::cs) => if Char.isSpace c 
+                         then List.rev (skipTrailing (List.rev cs))
+                         else lst
+    in
+      implode (skipTrailing (skipLeading chars))
+    end
     
-  (* Variable pattern - simple version, would be more sophisticated in real implementation *)
-  val var_pattern = "{{" (* opening marker *)
-  val var_pattern_end = "}}" (* closing marker *)
+  (* Custom implementation of String.findSubstring *)
+  fun string_findSubstring needle haystack =
+    let
+      val needle_len = String.size needle
+      val haystack_len = String.size haystack
+      
+      fun find start =
+        if start > haystack_len - needle_len then
+          NONE
+        else if String.substring(haystack, start, needle_len) = needle then
+          SOME start
+        else
+          find (start + 1)
+    in
+      if needle_len = 0 orelse haystack_len = 0 then NONE
+      else find 0
+    end
   
-  (* Check if a string has a variable reference *)
-  fun has_variable (template, var_name) =
-    String.isSubstring (var_pattern ^ " " ^ var_name ^ " " ^ var_pattern_end) template orelse
-    String.isSubstring (var_pattern ^ var_name ^ var_pattern_end) template
+  (* Storage for registered filters *)
+  val filters = ref ([] : (string * (string -> string)) list)
   
+  (* Register a filter function *)
+  fun register_filter (name, func) =
+    filters := (name, func) :: !filters
+    
+  (* Get a filter by name *)
+  fun get_filter name =
+    case List.find (fn (n, _) => n = name) (!filters) of
+      SOME (_, f) => SOME f
+    | NONE => NONE
+    
+  (* List all available filters *)
+  fun list_filters () =
+    map (fn (name, _) => name) (!filters)
+    
+  (* Define default filters and return them *)
+  fun default_filters () = 
+    let
+      (* Define default filter functions *)
+      fun uppercase s = String.map Char.toUpper s
+      fun lowercase s = String.map Char.toLower s
+      fun capitalize s =
+        case explode s of
+          [] => s
+        | c::cs => implode (Char.toUpper c :: cs)
+      
+      (* Define the list of filters *)
+      val default_filter_list = [
+        ("upper", uppercase),
+        ("lower", lowercase),
+        ("capitalize", capitalize)
+      ]
+      
+      (* Register the default filters *)
+      val _ = app register_filter default_filter_list
+    in
+      default_filter_list
+    end
+  
+  (* Check if a template contains a specific variable *)
+  fun has_variable (template, var_name) = 
+    let
+      val var_pattern = "{{" ^ var_name ^ "}}"
+      val stripped_var = string_trim var_name
+      val vars = extract_variables template
+    in
+      List.exists (fn v => v = stripped_var) vars
+    end
+
   (* Extract all variables from a template *)
   fun extract_variables template =
     let
-      (* Find all variable patterns in the template *)
-      fun find_vars (template, start_pos, acc) =
-        if start_pos >= String.size template then
+      fun extract acc pos =
+        if pos >= String.size template then
           acc
         else
-          let
-            val var_start = 
-              String.findSubstring var_pattern 
-                                  (String.substring(template, 
-                                                  start_pos,
-                                                  String.size template - start_pos))
-          in
-            case var_start of
-              SOME pos =>
-                let
-                  val real_start = start_pos + pos + String.size var_pattern
-                  val var_end = 
-                    String.findSubstring var_pattern_end
-                                        (String.substring(template, 
-                                                        real_start,
-                                                        String.size template - real_start))
-                in
-                  case var_end of
-                    SOME end_pos =>
-                      let
-                        val var_name = 
-                          String.substring(template, 
-                                          real_start, 
-                                          end_pos)
-                        val var_name = String.trim var_name
-                      in
-                        find_vars(template, 
-                                 real_start + end_pos + String.size var_pattern_end,
-                                 var_name :: acc)
-                      end
-                  | NONE => acc (* Malformed template - missing closing marker *)
-                end
-            | NONE => acc (* No more variables *)
-          end
+          case string_findSubstring "{{" template pos of
+            NONE => acc
+          | SOME start_idx =>
+              case string_findSubstring "}}" template (start_idx + 2) of
+                NONE => acc
+              | SOME end_idx => 
+                  let
+                    val var_expr = String.substring(template, start_idx + 2, end_idx - start_idx - 2)
+                    val var_name = 
+                      case String.tokens (fn c => c = #"|") var_expr of
+                        [] => ""
+                      | name::_ => string_trim name
+                    val new_pos = end_idx + 2
+                  in
+                    if var_name = "" orelse List.exists (fn v => v = var_name) acc then
+                      extract acc new_pos
+                    else
+                      extract (var_name :: acc) new_pos
+                  end
     in
-      find_vars(template, 0, [])
+      extract [] 0
     end
-  
-  (* Process a template string *)
-  fun process_string (template, variables) =
+
+  (* Helper function to get a variable value *)
+  fun lookup_var vars name =
+    case List.find (fn (k, _) => k = name) vars of
+      SOME (_, value) => SOME value
+    | NONE => NONE
+
+  (* Simple string replacement with variable lookup and filters *)
+  fun replace_variables (template, vars) =
     let
-      (* Process a single variable *)
-      fun process_var var_expr =
-        let
-          (* Check if there's a filter applied *)
-          val filter_parts = String.tokens (fn c => c = #"|") var_expr
-          val var_name = String.trim (List.nth(filter_parts, 0))
-          
-          (* Look up the variable value *)
-          val var_value = 
-            case List.find (fn (k, _) => k = var_name) variables of
-              SOME (_, v) => v
-            | NONE => raise UndefinedVariable("Variable not defined: " ^ var_name)
-            
-          (* Apply filter if present *)
-          val result = 
-            if length filter_parts > 1 then
+      (* Parse a variable with optional filter *)
+      fun parse_var var_str =
+        case String.tokens (fn c => c = #"|") var_str of
+          [] => ("", NONE)
+        | [var_name] => (string_trim var_name, NONE)
+        | var_name::filter_name::_ => (string_trim var_name, SOME (string_trim filter_name))
+      
+      (* Apply filter if specified *)
+      fun apply_filter value filter_name_opt =
+        case filter_name_opt of
+          NONE => value
+        | SOME filter_name =>
+            case get_filter filter_name of
+              SOME filter_fn => filter_fn value
+            | NONE => value
+      
+      (* Recursive replacement function *)
+      fun replace_all acc remaining =
+        if remaining = "" then
+          acc
+        else
+          case string_findSubstring "{{" remaining of
+            NONE => acc ^ remaining
+          | SOME start_idx =>
               let
-                val filter_name = String.trim (List.nth(filter_parts, 1))
-                val filter_fn = 
-                  HashTable.lookup filter_registry filter_name
-                  handle _ => raise TemplateError("Unknown filter: " ^ filter_name)
+                val prefix = String.substring(remaining, 0, start_idx)
+                val after_start = String.substring(remaining, 
+                                                 start_idx + 2, 
+                                                 String.size remaining - start_idx - 2)
               in
-                filter_fn var_value
+                case string_findSubstring "}}" after_start of
+                  NONE => acc ^ remaining (* Unclosed variable, return as-is *)
+                | SOME end_idx =>
+                    let
+                      val var_expr = String.substring(after_start, 0, end_idx)
+                      val (var_name, filter) = parse_var var_expr
+                      
+                      val var_value = case lookup_var vars var_name of
+                                        SOME v => v
+                                      | NONE => raise UndefinedVariable var_name
+                                        
+                      val final_value = apply_filter var_value filter
+                      
+                      val remaining_suffix = String.substring(after_start, 
+                                                           end_idx + 2, 
+                                                           String.size after_start - end_idx - 2)
+                    in
+                      replace_all (acc ^ prefix ^ final_value) remaining_suffix
+                    end
               end
-            else
-              var_value
-        in
-          result
-        end
-      
-      (* Find and replace all variables in the template *)
-      fun replace_vars (template, start_pos, acc) =
-        if start_pos >= String.size template then
+    in
+      replace_all "" template
+    end
+  
+  (* Conditional replacement with if blocks *)
+  fun replace_conditionals (template, vars) =
+    let
+      (* Recursive replacement function *)
+      fun replace_all acc remaining =
+        if remaining = "" then
           acc
         else
-          let
-            val var_start = 
-              String.findSubstring var_pattern 
-                                  (String.substring(template, 
-                                                  start_pos,
-                                                  String.size template - start_pos))
-          in
-            case var_start of
-              SOME pos =>
-                let
-                  val prefix = 
-                    acc ^ String.substring(template, start_pos, pos)
-                  val real_start = start_pos + pos + String.size var_pattern
-                  val var_end = 
-                    String.findSubstring var_pattern_end
-                                        (String.substring(template, 
-                                                        real_start,
-                                                        String.size template - real_start))
-                in
-                  case var_end of
-                    SOME end_pos =>
-                      let
-                        val var_expr = 
-                          String.substring(template, 
-                                          real_start, 
-                                          end_pos)
-                        val var_value = process_var (String.trim var_expr)
-                      in
-                        replace_vars(template, 
-                                    real_start + end_pos + String.size var_pattern_end,
-                                    prefix ^ var_value)
-                      end
-                  | NONE => 
-                      (* Malformed template - missing closing marker *)
-                      replace_vars(template, 
-                                  start_pos + pos + String.size var_pattern,
-                                  prefix ^ var_pattern)
-                end
-            | NONE => 
-                (* No more variables, append the rest of the template *)
-                acc ^ String.substring(template, 
-                                      start_pos, 
-                                      String.size template - start_pos)
-          end
+          case string_findSubstring "{%if" remaining of
+            NONE => acc ^ remaining
+          | SOME start_idx =>
+              let
+                val prefix = String.substring(remaining, 0, start_idx)
+                val after_start = String.substring(remaining, 
+                                                 start_idx + 4, 
+                                                 String.size remaining - start_idx - 4)
+              in
+                case string_findSubstring "%}" after_start of
+                  NONE => acc ^ remaining (* Unclosed if, return as-is *)
+                | SOME cond_end_idx =>
+                    let
+                      val condition = string_trim(String.substring(after_start, 0, cond_end_idx))
+                      val after_cond = String.substring(after_start, 
+                                                      cond_end_idx + 2, 
+                                                      String.size after_start - cond_end_idx - 2)
+                    in
+                      case string_findSubstring "{%endif%}" after_cond of
+                        NONE => acc ^ remaining (* No endif, return as-is *)
+                      | SOME endif_idx =>
+                          let
+                            val if_content = String.substring(after_cond, 0, endif_idx)
+                            val else_content = 
+                              case string_findSubstring "{%else%}" if_content of
+                                SOME else_idx =>
+                                  let
+                                    val true_content = String.substring(if_content, 0, else_idx)
+                                    val false_content = String.substring(if_content, 
+                                                                      else_idx + 7, 
+                                                                      String.size if_content - else_idx - 7)
+                                  in
+                                    (true_content, false_content)
+                                  end
+                              | NONE => (if_content, "")
+                                
+                            val var_name = string_trim condition
+                            val condition_result = 
+                              case lookup_var vars var_name of
+                                SOME "true" => true
+                              | SOME "yes" => true
+                              | SOME "1" => true
+                              | _ => false
+                                
+                            val result_content = if condition_result then #1 else_content else #2 else_content
+                                
+                            val remaining_suffix = String.substring(after_cond, 
+                                                                 endif_idx + 9, 
+                                                                 String.size after_cond - endif_idx - 9)
+                          in
+                            replace_all (acc ^ prefix ^ result_content) remaining_suffix
+                          end
+                    end
+              end
     in
-      replace_vars(template, 0, "")
+      replace_all "" template
     end
-    handle UndefinedVariable msg => raise TemplateError(msg)
   
-  (* Process a template file *)
-  fun process_file (input_file, variables, output_file) =
+  (* Process a template string with variables *)
+  fun process_string (template, vars) =
     let
-      val input = TextIO.openIn input_file
-      val template = TextIO.inputAll input
-      val _ = TextIO.closeIn input
+      (* First replace conditionals, then variables *)
+      val after_conditionals = replace_conditionals (template, vars)
+    in
+      replace_variables (after_conditionals, vars)
+      handle UndefinedVariable var => raise UndefinedVariable var
+    end
+    
+  (* Process a template file *)
+  fun process_file (input_file, vars, output_file) =
+    let
+      (* Read the input file *)
+      val template_content = 
+        let
+          val file = TextIO.openIn input_file
+                     handle _ => raise TemplateError ("Cannot open template file: " ^ input_file)
+          val content = TextIO.inputAll file
+          val _ = TextIO.closeIn file
+        in
+          content
+        end
+        
+      (* Process the template *)
+      val processed = process_string (template_content, vars)
       
-      val processed = process_string(template, variables)
-      
-      val output = TextIO.openOut output_file
-      val _ = TextIO.output(output, processed)
-      val _ = TextIO.closeOut output
+      (* Write to the output file *)
+      val out = TextIO.openOut output_file
+               handle _ => raise TemplateError ("Cannot open output file: " ^ output_file)
+      val _ = TextIO.output (out, processed)
+      val _ = TextIO.closeOut out
     in
       ()
     end
-    handle IO.Io {name, ...} => 
-      raise TemplateError("File error: " ^ name)
-  
-  (* Register a filter *)
-  fun register_filter (name, fn_) =
-    HashTable.insert filter_registry (name, fn_)
-  
-  (* Get a filter *)
-  fun get_filter name =
-    SOME (HashTable.lookup filter_registry name)
-    handle _ => NONE
-  
-  (* List all filters *)
-  fun list_filters () =
-    HashTable.foldi (fn (name, _, acc) => name :: acc) [] filter_registry
-  
-  (* Register default filters *)
-  fun default_filters () = [
-    ("upper", String.map Char.toUpper),
-    ("lower", String.map Char.toLower),
-    ("capitalize", fn s => 
-      if String.size s > 0 then
-        String.str(Char.toUpper(String.sub(s, 0))) ^ 
-        String.substring(s, 1, String.size s - 1)
-      else
-        s),
-    ("trim", String.trim),
-    ("basename", OS.Path.file),
-    ("dirname", OS.Path.dir),
-    ("default", fn s => if s = "" then "default" else s)
-  ]
-  
+
   (* Initialize default filters *)
-  val _ = 
-    List.app (fn (name, fn_) => register_filter(name, fn_)) (default_filters())
+  val _ = default_filters()
 end
