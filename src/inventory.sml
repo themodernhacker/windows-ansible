@@ -75,7 +75,7 @@ structure Inventory : INVENTORY = struct
   fun get_group (inv: inventory, name) =
     HashTable.find (#groups inv) name
   
-  (* Remove a group *)
+  (* Remove a group - FIXED to return unit *)
   fun remove_group (inv: inventory, name) =
     let
       (* Remove group from children lists of all other groups *)
@@ -105,7 +105,7 @@ structure Inventory : INVENTORY = struct
   fun get_host (inv: inventory, name) =
     HashTable.find (#hosts inv) name
   
-  (* Remove a host *)
+  (* Remove a host - FIXED to return unit *)
   fun remove_host (inv: inventory, name) =
     let
       (* Remove host from all groups *)
