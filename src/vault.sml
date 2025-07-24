@@ -39,10 +39,9 @@ structure Vault : VAULT = struct
       val bytes2 = map Char.ord (explode s2)
       
       (* Repeat the key if necessary *)
-      fun extendKey [] _ = []
-        | extendKey key [] = []
+      fun extendKey key [] = []
+        | extendKey [] bs = extendKey bytes2 bs
         | extendKey (k::ks) (b::bs) = k :: extendKey ks bs
-        | extendKey [] (b::bs) = extendKey bytes2 (b::bs)
       
       val extendedKey = extendKey bytes2 bytes1
       

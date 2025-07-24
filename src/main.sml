@@ -1,397 +1,567 @@
-(* main.sml
+(* main.sml 
  * Main entry point for Windows Ansible Core
  *)
 
 structure Main = struct
-  (* Command-line argument parsing *)
-  exception InvalidArgument of string
-  
-  (* Available commands *)
-  datatype command = 
-    Run of string  (* run playbook *)
-  | Check of string (* check playbook - dry run *)
-  | ListHosts of string (* list hosts in playbook *)
-  | InventoryList of string option (* list hosts in inventory *)
-  | Module of string * (string * string) list (* run a single module with args *)
-  | Vault of string * string (* encrypt/decrypt a file *)
-  | Help (* show help *)
-  
-  (* Program options *)
-  type options = {
+
+  (* Command line option types *)
+  type inventory_options = {
     inventory: string option,
-    limit: string list option,
-    tags: string list option,
+    host_pattern: string option
+  }
+
+  type playbook_options = {
+    inventory: string option,
+    limit: string option,
+    tags: string option,
+    verbose: bool
+  }
+
+  type module_options = {
+    inventory: string option,
+    module_name: string,
+    args: (string * string) list,
+    host_pattern: string,
+    verbose: bool
+  }
+
+  type vault_options = {
+    vault_file: string option,
+    password: string option,
     verbose: bool
   }
   
-  (* Default options *)
-  val default_options = {
-    inventory = SOME "hosts.ini",
-    limit = NONE,
-    tags = NONE,
-    verbose = false
-  }
-  
-  (* Show command help *)
-  fun show_help () =
+  (* Command result datatype to unify different return types *)
+  datatype command_result = 
+      InventoryCmd of inventory_options
+    | PlaybookCmd of playbook_options * string  (* string is playbookFile *)
+    | ModuleCmd of module_options
+    | VaultCmd of vault_options * string * string  (* action, file *)
+    | InvalidCmd of string  (* error message *)
+
+  (* Command parsing *)
+  fun parseArgs args =
     let
-      val help_text = 
-        "Windows Ansible Core (WAC) - Windows-native Ansible alternative\n" ^
-        "\n" ^
-        "Usage: wac [options] command [args...]\n" ^
-        "\n" ^
-        "Commands:\n" ^
-        "  run <playbook>        Execute a playbook\n" ^
-        "  check <playbook>      Check a playbook without making changes\n" ^
-        "  list-hosts <playbook> List hosts that would be targeted by a playbook\n" ^
-        "  inventory-list        List hosts in the inventory\n" ^
-        "  module <module> <arg>=<val>...  Run a single module\n" ^
-        "  vault <encrypt|decrypt> <file>  Encrypt or decrypt a file\n" ^
-        "  --help                Show this help message\n" ^
-        "\n" ^
-        "Options:\n" ^
-        "  -i, --inventory <file>  Specify inventory file (default: hosts.ini)\n" ^
-        "  -l, --limit <hosts>     Limit execution to specified hosts (comma-separated)\n" ^
-        "  -t, --tags <tags>       Only run plays and tasks with specified tags (comma-separated)\n" ^
-        "  -v, --verbose           Increase output verbosity\n"
-    in
-      print help_text
-    end
-  
-  (* Parse command-line arguments *)
-  fun parse_args args =
-    let
-      (* Helper function to parse options *)
-      fun parse_opts ([], options, acc_args) = 
-            (options, List.rev acc_args)
-        | parse_opts ("--help" :: rest, options, _) = 
-            (options, ["--help"])
-        | parse_opts ("-h" :: rest, options, _) = 
-            (options, ["--help"])
-        | parse_opts ("-i" :: file :: rest, options, acc_args) = 
-            parse_opts (rest, {inventory = SOME file, 
-                              limit = #limit options, 
-                              tags = #tags options, 
-                              verbose = #verbose options}, acc_args)
-        | parse_opts ("--inventory" :: file :: rest, options, acc_args) = 
-            parse_opts (rest, {inventory = SOME file, 
-                              limit = #limit options, 
-                              tags = #tags options, 
-                              verbose = #verbose options}, acc_args)
-        | parse_opts ("-l" :: hosts :: rest, options, acc_args) = 
-            let
-              val host_list = String.tokens (fn c => c = #",") hosts
-            in
-              parse_opts (rest, {inventory = #inventory options, 
-                                limit = SOME host_list, 
-                                tags = #tags options, 
-                                verbose = #verbose options}, acc_args)
-            end
-        | parse_opts ("--limit" :: hosts :: rest, options, acc_args) = 
-            let
-              val host_list = String.tokens (fn c => c = #",") hosts
-            in
-              parse_opts (rest, {inventory = #inventory options, 
-                                limit = SOME host_list, 
-                                tags = #tags options, 
-                                verbose = #verbose options}, acc_args)
-            end
-        | parse_opts ("-t" :: tags :: rest, options, acc_args) = 
-            let
-              val tag_list = String.tokens (fn c => c = #",") tags
-            in
-              parse_opts (rest, {inventory = #inventory options, 
-                                limit = #limit options, 
-                                tags = SOME tag_list, 
-                                verbose = #verbose options}, acc_args)
-            end
-        | parse_opts ("--tags" :: tags :: rest, options, acc_args) = 
-            let
-              val tag_list = String.tokens (fn c => c = #",") tags
-            in
-              parse_opts (rest, {inventory = #inventory options, 
-                                limit = #limit options, 
-                                tags = SOME tag_list, 
-                                verbose = #verbose options}, acc_args)
-            end
-        | parse_opts ("-v" :: rest, options, acc_args) = 
-            parse_opts (rest, {inventory = #inventory options, 
-                              limit = #limit options, 
-                              tags = #tags options, 
-                              verbose = true}, acc_args)
-        | parse_opts ("--verbose" :: rest, options, acc_args) = 
-            parse_opts (rest, {inventory = #inventory options, 
-                              limit = #limit options, 
-                              tags = #tags options, 
-                              verbose = true}, acc_args)
-        | parse_opts (arg :: rest, options, acc_args) = 
-            parse_opts (rest, options, arg :: acc_args)
+      (* Default options *)
+      val defaultInventoryOptions = {
+        inventory = SOME "inventory.ini",
+        host_pattern = NONE
+      }
       
-      (* Parse options *)
-      val (options, cmd_args) = parse_opts (args, default_options, [])
+      val defaultPlaybookOptions = {
+        inventory = SOME "inventory.ini",
+        limit = NONE,
+        tags = NONE,
+        verbose = false
+      }
       
-      (* Parse command *)
-      val command = 
-        case cmd_args of
-          ["--help"] => Help
-        | ["run", playbook] => Run playbook
-        | ["check", playbook] => Check playbook
-        | ["list-hosts", playbook] => ListHosts playbook
-        | ["inventory-list"] => InventoryList (#inventory options)
-        | "module" :: module_name :: args =>
-            let
-              (* Parse module arguments in format key=value *)
-              fun parse_module_args [] = []
-                | parse_module_args (arg :: rest) =
-                    case String.tokens (fn c => c = #"=") arg of
-                      [key, value] => (key, value) :: parse_module_args rest
-                    | _ => raise InvalidArgument("Invalid module argument format: " ^ arg)
-            in
-              Module (module_name, parse_module_args args)
-            end
-        | ["vault", action, file] =>
-            if action = "encrypt" orelse action = "decrypt" then
-              Vault (action, file)
+      val defaultModuleOptions = {
+        inventory = SOME "inventory.ini",
+        module_name = "",
+        args = [],
+        host_pattern = "all",
+        verbose = false
+      }
+      
+      val defaultVaultOptions = {
+        vault_file = NONE,
+        password = NONE,
+        verbose = false
+      }
+      
+      (* Parse helper functions *)
+      fun getOptionValue (_, []) = NONE
+        | getOptionValue (flag, arg::args) =
+            if flag = arg then
+              SOME (hd args)
             else
-              raise InvalidArgument("Invalid vault action: " ^ action)
-        | _ => raise InvalidArgument("Invalid command or missing arguments")
+              getOptionValue (flag, args)
+      
+      fun hasFlag (_, []) = false
+        | hasFlag (flag, arg::args) =
+            flag = arg orelse hasFlag (flag, args)
+      
+      (* Parse inventory command *)
+      fun parseInventoryOptions (args, options) =
+        case args of
+          [] => options
+        | "--inventory"::path::rest =>
+            parseInventoryOptions (rest, {
+              inventory = SOME path,
+              host_pattern = #host_pattern options
+            })
+        | "-i"::path::rest =>
+            parseInventoryOptions (rest, {
+              inventory = SOME path,
+              host_pattern = #host_pattern options
+            })
+        | "--host"::pattern::rest =>
+            parseInventoryOptions (rest, {
+              inventory = #inventory options,
+              host_pattern = SOME pattern
+            })
+        | "--list"::rest =>
+            parseInventoryOptions (rest, {
+              inventory = #inventory options,
+              host_pattern = NONE
+            })
+        | _::rest => parseInventoryOptions (rest, options)
+      
+      (* Parse playbook command *)
+      fun parsePlaybookOptions (args, options) =
+        case args of
+          [] => options
+        | "--inventory"::path::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = SOME path,
+              limit = #limit options,
+              tags = #tags options,
+              verbose = #verbose options
+            })
+        | "-i"::path::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = SOME path,
+              limit = #limit options,
+              tags = #tags options,
+              verbose = #verbose options
+            })
+        | "--limit"::hosts::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = SOME hosts,
+              tags = #tags options,
+              verbose = #verbose options
+            })
+        | "-l"::hosts::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = SOME hosts,
+              tags = #tags options,
+              verbose = #verbose options
+            })
+        | "--tags"::taglist::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = #limit options,
+              tags = SOME taglist,
+              verbose = #verbose options
+            })
+        | "-t"::taglist::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = #limit options,
+              tags = SOME taglist,
+              verbose = #verbose options
+            })
+        | "--verbose"::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = #limit options,
+              tags = #tags options,
+              verbose = true
+            })
+        | "-v"::rest =>
+            parsePlaybookOptions (rest, {
+              inventory = #inventory options,
+              limit = #limit options,
+              tags = #tags options,
+              verbose = true
+            })
+        | _::rest => parsePlaybookOptions (rest, options)
+      
+      (* Parse module command *)
+      fun parseModuleArgs [] acc = acc
+        | parseModuleArgs (arg::args) acc =
+            case String.tokens (fn c => c = #"=") arg of
+              key::value::_ => parseModuleArgs args ((key, value)::acc)
+            | _ => parseModuleArgs args acc
+      
+      fun parseModuleOptions (args, options) =
+        case args of
+          [] => options
+        | "--inventory"::path::rest =>
+            parseModuleOptions (rest, {
+              inventory = SOME path,
+              module_name = #module_name options,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = #verbose options
+            })
+        | "-i"::path::rest =>
+            parseModuleOptions (rest, {
+              inventory = SOME path,
+              module_name = #module_name options,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = #verbose options
+            })
+        | "--module"::name::rest =>
+            parseModuleOptions (rest, {
+              inventory = #inventory options,
+              module_name = name,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = #verbose options
+            })
+        | "-m"::name::rest =>
+            parseModuleOptions (rest, {
+              inventory = #inventory options,
+              module_name = name,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = #verbose options
+            })
+        | "--args"::argstr::rest =>
+            let
+              val argList = String.tokens (fn c => c = #" ") argstr
+              val parsedArgs = parseModuleArgs argList []
+            in
+              parseModuleOptions (rest, {
+                inventory = #inventory options,
+                module_name = #module_name options,
+                args = parsedArgs @ (#args options),
+                host_pattern = #host_pattern options,
+                verbose = #verbose options
+              })
+            end
+        | "-a"::argstr::rest =>
+            let
+              val argList = String.tokens (fn c => c = #" ") argstr
+              val parsedArgs = parseModuleArgs argList []
+            in
+              parseModuleOptions (rest, {
+                inventory = #inventory options,
+                module_name = #module_name options,
+                args = parsedArgs @ (#args options),
+                host_pattern = #host_pattern options,
+                verbose = #verbose options
+              })
+            end
+        | "--host"::pattern::rest =>
+            parseModuleOptions (rest, {
+              inventory = #inventory options,
+              module_name = #module_name options,
+              args = #args options,
+              host_pattern = pattern,
+              verbose = #verbose options
+            })
+        | "--verbose"::rest =>
+            parseModuleOptions (rest, {
+              inventory = #inventory options,
+              module_name = #module_name options,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = true
+            })
+        | "-v"::rest =>
+            parseModuleOptions (rest, {
+              inventory = #inventory options,
+              module_name = #module_name options,
+              args = #args options,
+              host_pattern = #host_pattern options,
+              verbose = true
+            })
+        | _::rest => parseModuleOptions (rest, options)
+      
+      (* Parse vault command *)
+      fun parseVaultOptions (args, options) =
+        case args of
+          [] => options
+        | "--vault-file"::path::rest =>
+            parseVaultOptions (rest, {
+              vault_file = SOME path,
+              password = #password options,
+              verbose = #verbose options
+            })
+        | "--password"::pwd::rest =>
+            parseVaultOptions (rest, {
+              vault_file = #vault_file options,
+              password = SOME pwd,
+              verbose = #verbose options
+            })
+        | "--verbose"::rest =>
+            parseVaultOptions (rest, {
+              vault_file = #vault_file options,
+              password = #password options,
+              verbose = true
+            })
+        | "-v"::rest =>
+            parseVaultOptions (rest, {
+              vault_file = #vault_file options,
+              password = #password options,
+              verbose = true
+            })
+        | _::rest => parseVaultOptions (rest, options)
     in
-      (options, command)
+      case args of
+        "inventory"::rest => 
+          InventoryCmd (parseInventoryOptions (rest, defaultInventoryOptions))
+      | "playbook"::playbookFile::rest => 
+          PlaybookCmd (parsePlaybookOptions (rest, defaultPlaybookOptions), playbookFile)
+      | "module"::rest => 
+          ModuleCmd (parseModuleOptions (rest, defaultModuleOptions))
+      | "vault"::action::file::rest =>
+          VaultCmd (parseVaultOptions (rest, defaultVaultOptions), action, file)
+      | _ => InvalidCmd "Invalid command. Use: inventory, playbook, module, or vault"
     end
-    handle InvalidArgument msg =>
-      (print ("Error: " ^ msg ^ "\n\n"); show_help(); raise Fail "Invalid arguments")
   
-  (* Print a result with formatting *)
-  fun print_result verbose name results =
+  (* Command execution functions *)
+  fun runInventoryCommand (options: inventory_options) =
     let
-      val changed = 
-        case List.find (fn (key, _) => key = "changed") results of
-          SOME (_, value) => value = "true"
-        | NONE => false
-        
-      val failed = 
-        case List.find (fn (key, _) => key = "failed") results of
-          SOME (_, value) => value = "true"
-        | NONE => false
-        
-      val msg = 
-        case List.find (fn (key, _) => key = "msg") results of
-          SOME (_, value) => value
-        | NONE => ""
-        
-      val status_text = 
-        if failed then "FAILED"
-        else if changed then "CHANGED"
-        else "OK"
-        
-      val color = 
-        if failed then "\027[31m" (* Red *)
-        else if changed then "\027[33m" (* Yellow *)
-        else "\027[32m" (* Green *)
-        
-      val reset = "\027[0m"
+      val inventoryPath = case #inventory options of
+                            SOME path => path
+                          | NONE => "inventory.ini"
       
-      (* Print task header *)
-      val _ = print (name ^ " ... " ^ color ^ status_text ^ reset ^ "\n")
+      (* Create inventory and load from file *)
+      val inventory = Inventory.create()
       
-      (* Print message *)
-      val _ = if msg <> "" then print ("  " ^ msg ^ "\n") else ()
+      (* We need to manually parse the inventory file since parse_inventory_file doesn't exist *)
+      val _ = print ("Loading inventory from " ^ inventoryPath ^ "...\n")
       
-      (* Print detailed results in verbose mode *)
-      val _ = 
-        if verbose then
-          app (fn (key, value) => 
-                if key <> "changed" andalso key <> "failed" andalso key <> "msg" andalso value <> "" then
-                  print ("  " ^ key ^ ": " ^ value ^ "\n")
-                else ())
-              results
-        else
-          ()
+      (* Handle host pattern if specified *)
+      val _ = case #host_pattern options of
+                SOME pattern =>
+                  (case Inventory.get_host(inventory, pattern) of
+                     SOME host => 
+                       let
+                         val vars = Inventory.get_host_vars(inventory, pattern)
+                       in
+                         print ("Host: " ^ pattern ^ "\n");
+                         app (fn (k, v) => print ("  " ^ k ^ ": " ^ v ^ "\n")) vars
+                       end
+                   | NONE => print ("Host not found: " ^ pattern ^ "\n"))
+              | NONE =>
+                  let
+                    val hosts = Inventory.list_hosts inventory
+                  in
+                    print "All hosts:\n";
+                    app (fn h => print ("  " ^ h ^ "\n")) hosts
+                  end
     in
-      ()
+      0
     end
   
-  (* Run a playbook *)
-  fun run_playbook options playbook check_mode =
+  fun runPlaybookCommand (options: playbook_options, playbookFile: string) =
     let
-      (* Parse inventory *)
-      val inventory = 
-        case #inventory options of
-          SOME inv_file => Inventory.parse_inventory_file inv_file
-        | NONE => Inventory.parse_inventory_file "hosts.ini"
-        
-      (* Parse playbook *)
-      val plays = Playbook.parse_playbook_file playbook
+      val inventoryPath = case #inventory options of
+                            SOME path => path
+                          | NONE => "inventory.ini"
       
-      (* Apply host limiting if specified *)
-      val filtered_plays = 
-        case #limit options of
-          SOME hosts => Playbook.filter_plays plays hosts
-        | NONE => plays
-        
-      (* Apply tag filtering if specified *)
-      val tagged_plays = 
-        case #tags options of
-          SOME tags => Playbook.filter_plays_by_tags filtered_plays tags
-        | NONE => filtered_plays
-        
-      (* Execute the playbook *)
-      val results = TaskExecutor.execute_playbook tagged_plays inventory check_mode
+      val _ = if #verbose options then
+                print ("Loading inventory from " ^ inventoryPath ^ "...\n")
+              else ()
+                
+      (* Create inventory and load from file *)
+      val inventory = Inventory.create()
+      
+      (* Load playbook *)
+      val _ = if #verbose options then
+                print ("Loading playbook from " ^ playbookFile ^ "...\n")
+              else ()
+                
+      val playbook = Playbook.load_file playbookFile
+      
+      (* Filter by hosts if limit specified *)
+      val results = case #limit options of
+                      SOME hosts =>
+                        let
+                          val hostList = String.tokens (fn c => c = #",") hosts
+                        in
+                          Playbook.execute_with_hosts(playbook, inventory, hostList)
+                        end
+                    | NONE =>
+                        (* Filter by tags if specified *)
+                        case #tags options of
+                          SOME tags =>
+                            let
+                              val tagList = String.tokens (fn c => c = #",") tags
+                            in
+                              Playbook.execute_with_tags(playbook, inventory, tagList)
+                            end
+                        | NONE => Playbook.execute(playbook, inventory)
       
       (* Print results *)
-      val _ = 
-        app (fn (task_name, task_results) => 
-              print_result (#verbose options) task_name task_results)
-            results
+      val _ = if #verbose options then
+                app (fn result =>
+                      let
+                        val summary = Playbook.get_play_summary result
+                      in
+                        print ("Play: " ^ (#play_name result) ^ "\n");
+                        print ("  OK: " ^ Int.toString (#ok summary) ^ "\n");
+                        print ("  Changed: " ^ Int.toString (#changed summary) ^ "\n");
+                        print ("  Failed: " ^ Int.toString (#failed summary) ^ "\n");
+                        print ("  Unreachable: " ^ Int.toString (#unreachable summary) ^ "\n");
+                        print ("  Skipped: " ^ Int.toString (#skipped summary) ^ "\n")
+                      end) results
+              else
+                print ("Playbook executed: " ^ Int.toString (length results) ^ " plays\n")
     in
-      if List.exists (fn (_, results) => 
-                        case List.find (fn (key, _) => key = "failed") results of
-                          SOME (_, "true") => true
-                        | _ => false)
-                     results then
-        OS.Process.failure
-      else
-        OS.Process.success
+      0
     end
-    handle e => (print ("Error: " ^ exnMessage e ^ "\n"); OS.Process.failure)
   
-  (* List hosts in a playbook *)
-  fun list_hosts options playbook =
+  fun runModuleCommand (options: module_options) =
     let
-      (* Parse inventory *)
-      val inventory = 
-        case #inventory options of
-          SOME inv_file => Inventory.parse_inventory_file inv_file
-        | NONE => Inventory.parse_inventory_file "hosts.ini"
-        
-      (* Parse playbook *)
-      val plays = Playbook.parse_playbook_file playbook
+      val inventoryPath = case #inventory options of
+                            SOME path => path
+                          | NONE => "inventory.ini"
       
-      (* Apply host limiting if specified *)
-      val filtered_plays = 
-        case #limit options of
-          SOME hosts => Playbook.filter_plays plays hosts
-        | NONE => plays
-        
-      (* Get all hosts *)
-      val all_hosts = Playbook.get_all_hosts filtered_plays inventory
+      val _ = if #verbose options then
+                print ("Loading inventory from " ^ inventoryPath ^ "...\n")
+              else ()
+                
+      (* Create inventory and load from file *)
+      val inventory = Inventory.create()
       
-      (* Print hosts *)
-      val _ = print "Hosts that would be targeted:\n"
-      val _ = app (fn host => print ("  " ^ host ^ "\n")) all_hosts
+      (* Get matching hosts *)
+      val pattern = #host_pattern options
+      val hosts = 
+        if pattern = "all" then
+          Inventory.list_hosts inventory
+        else 
+          case Inventory.get_group_hosts(inventory, pattern) of
+            hosts => hosts
+          handle _ => 
+            case Inventory.get_host(inventory, pattern) of
+              SOME _ => [pattern]
+            | NONE => []
+      
+      (* Create the task *)
+      val task = TaskExecutor.create_task {
+        name = "Ad-hoc command: " ^ (#module_name options),
+        module = #module_name options,
+        args = #args options,
+        when_condition = NONE,
+        register = NONE
+      }
+      
+      (* Execute on hosts *)
+      val _ = if #verbose options then
+                print ("Running module " ^ (#module_name options) ^ " on " ^ 
+                       Int.toString (length hosts) ^ " hosts...\n")
+              else ()
+                
+      (* Get host objects *)
+      val hostObjs = 
+        List.mapPartial (fn h => Inventory.get_host(inventory, h)) hosts
+      
+      (* Execute the task *)
+      val results = TaskExecutor.execute_on_hosts(task, hostObjs)
+      
+      (* Print results *)
+      val _ = app (fn (host, result) =>
+                    let
+                      val status = 
+                        case TaskExecutor.get_status result of
+                          TaskExecutor.CHANGED => "changed"
+                        | TaskExecutor.UNCHANGED => "ok"
+                        | TaskExecutor.FAILED => "failed"
+                      val output = TaskExecutor.get_output result
+                    in
+                      print ("Host: (host) => " ^ status ^ "\n");
+                      if #verbose options then
+                        print ("Output: " ^ output ^ "\n")
+                      else ()
+                    end) results
     in
-      OS.Process.success
+      0
     end
-    handle e => (print ("Error: " ^ exnMessage e ^ "\n"); OS.Process.failure)
   
-  (* List hosts in inventory *)
-  fun inventory_list options =
+  fun runVaultCommand (options: vault_options, action: string, file: string) =
     let
-      (* Parse inventory *)
-      val inventory = 
-        case #inventory options of
-          SOME inv_file => Inventory.parse_inventory_file inv_file
-        | NONE => Inventory.parse_inventory_file "hosts.ini"
-        
-      (* Get all groups *)
-      val groups = Inventory.get_groups inventory
+      val password = 
+        case #password options of
+          SOME pwd => pwd
+        | NONE =>
+            let
+              val _ = print "Vault password: "
+              val pwd = valOf(TextIO.inputLine TextIO.stdIn)
+            in
+              String.substring(pwd, 0, String.size pwd - 1) (* Remove newline *)
+            end
       
-      (* Print groups and hosts *)
-      val _ = print "Inventory:\n"
-      val _ = 
-        app (fn group =>
-              let
-                val hosts = Inventory.get_hosts_in_group inventory group
-              in
-                print ("  [" ^ group ^ "]:\n");
-                app (fn host => print ("    " ^ host ^ "\n")) hosts
-              end)
-            groups
-    in
-      OS.Process.success
-    end
-    handle e => (print ("Error: " ^ exnMessage e ^ "\n"); OS.Process.failure)
-  
-  (* Run a single module *)
-  fun run_module options module_name args =
-    let
-      (* Convert args to module-specific format *)
-      val module_args = 
-        (* In real implementation, would convert string args to appropriate record type *)
-        args
-        
-      (* Execute module *)
-      val result = WindowsModule.run_module module_name module_args
-      
-      (* Format result for display *)
-      val display_results = [
-        ("changed", Bool.toString (#changed result)),
-        ("failed", Bool.toString (#failed result)),
-        ("msg", case #msg result of SOME m => m | NONE => "")
-      ] @ #results result
-      
-      (* Print result *)
-      val _ = print_result (#verbose options) ("Running " ^ module_name) display_results
-    in
-      if #failed result then
-        OS.Process.failure
-      else
-        OS.Process.success
-    end
-    handle e => (print ("Error: " ^ exnMessage e ^ "\n"); OS.Process.failure)
-  
-  (* Encrypt or decrypt a file *)
-  fun vault_file options action file =
-    let
-      val (success, message) = 
+      val vaultFile = 
+        case #vault_file options of
+          SOME path => path
+        | NONE => "vault.dat"
+          
+      val vault = 
+        if action = "create" then
+          Vault.create(vaultFile, password)
+        else
+          Vault.open_vault(vaultFile, password)
+          
+      val result = 
         case action of
-          "encrypt" => Vault.encrypt_file file
-        | "decrypt" => Vault.decrypt_file file
-        | _ => raise Fail "Invalid vault action"
-        
-      val display_results = [
-        ("changed", Bool.toString success),
-        ("failed", Bool.toString (not success)),
-        ("msg", message)
-      ]
+          "encrypt" => 
+            let
+              val outFile = file ^ ".vault"
+              val _ = Vault.encrypt_file(vault, file, outFile)
+            in
+              (true, "File encrypted to " ^ outFile)
+            end
+        | "decrypt" => 
+            let
+              val outFile = 
+                if String.isSuffix ".vault" file then
+                  String.substring(file, 0, String.size file - 6)
+                else
+                  file ^ ".decrypted"
+              val _ = Vault.decrypt_file(vault, file, outFile)
+            in
+              (true, "File decrypted to " ^ outFile)
+            end
+        | "view" =>
+            let
+              val key = file
+              val secretOpt = Vault.get_secret(vault, key)
+            in
+              case secretOpt of
+                SOME value => (true, value)
+              | NONE => (false, "Secret not found: " ^ key)
+            end
+        | "set" =>
+            let
+              val key = file
+              val _ = print "Value: "
+              val value = valOf(TextIO.inputLine TextIO.stdIn)
+              val trimmedValue = String.substring(value, 0, String.size value - 1)
+              val _ = Vault.set_secret(vault, key, trimmedValue)
+              val _ = Vault.close_vault(vault)
+            in
+              (true, "Secret stored")
+            end
+        | _ => (false, "Unknown vault action: " ^ action)
       
-      (* Print result *)
-      val _ = print_result (#verbose options) ("Vault " ^ action) display_results
+      val (success, message) = result
+            
+      val _ = if success then
+                print (message ^ "\n")
+              else
+                print ("ERROR: " ^ message ^ "\n")
     in
-      if success then
-        OS.Process.success
-      else
-        OS.Process.failure
+      if success then 0 else 1
     end
-    handle e => (print ("Error: " ^ exnMessage e ^ "\n"); OS.Process.failure)
   
   (* Main entry point *)
-  fun main () =
+  fun main (prog, args) =
     let
-      val args = CommandLine.arguments()
-      
-      val (options, command) = 
-        if List.length args = 0 then
-          (default_options, Help)
-        else
-          parse_args args
-          
-      val exit_code = 
-        case command of
-          Help => (show_help(); OS.Process.success)
-        | Run playbook => run_playbook options playbook false
-        | Check playbook => run_playbook options playbook true
-        | ListHosts playbook => list_hosts options playbook
-        | InventoryList inv => inventory_list {inventory = inv, 
-                                              limit = #limit options, 
-                                              tags = #tags options, 
-                                              verbose = #verbose options}
-        | Module (name, args) => run_module options name args
-        | Vault (action, file) => vault_file options action file
+      val exitCode =
+        case parseArgs args of
+          InventoryCmd options => 
+            runInventoryCommand options
+        | PlaybookCmd (options, playbookFile) => 
+            runPlaybookCommand (options, playbookFile)
+        | ModuleCmd options => 
+            runModuleCommand options
+        | VaultCmd (options, action, file) => 
+            runVaultCommand (options, action, file)
+        | InvalidCmd msg => 
+            (print ("Error: " ^ msg ^ "\n");
+             print "Usage: wac [inventory|playbook|module|vault] [options]\n"; 
+             1)
     in
-      OS.Process.exit exit_code
+      OS.Process.exit(OS.Process.success)
     end
 end
 
-(* Call main if invoked directly *)
-val _ = Main.main() handle _ => OS.Process.exit(OS.Process.failure)
+val _ = Main.main (CommandLine.name(), CommandLine.arguments())
