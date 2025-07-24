@@ -363,8 +363,8 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
         raise QueryError ("Failed to create user: " ^ stderr)
     end
 
-  (* Create group *)
-  fun create_group {parent_ou, groupname, description, scope="Global", type="Security"} =
+  (* Create group - Fixed "type" parameter name to "group_type" *)
+  fun create_group {parent_ou, groupname, description, scope="Global", group_type="Security"} =
     let
       (* Verify connection *)
       val _ = if not (is_connected()) then
@@ -381,7 +381,7 @@ structure ActiveDirectory : ACTIVE_DIRECTORY = struct
                   "', $secpasswd);" ^
         "  New-ADGroup -Credential $creds -Name '" ^ groupname ^ "'" ^
         "    -Path '" ^ parent_ou ^ "' -Description '" ^ description ^ "'" ^
-        "    -GroupScope " ^ scope ^ " -GroupCategory " ^ type ^ ";" ^
+        "    -GroupScope " ^ scope ^ " -GroupCategory " ^ group_type ^ ";" ^
         "  Write-Output 'Group created successfully'" ^
         "} catch {" ^
         "  Write-Error ('Group creation failed: ' + $_.Exception.Message)" ^
