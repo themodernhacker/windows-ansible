@@ -1,0 +1,13 @@
+---
+- name: Test Playbook
+  hosts: windows
+  tasks:
+    - name: Ensure directory exists
+      win_file:
+        path: C:/temp
+        state: directory
+    
+    - name: Create a test file
+      win_copy:
+        content: "This is a test file"
+        dest: C:/temp/test.txt

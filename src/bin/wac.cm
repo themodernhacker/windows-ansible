@@ -1,0 +1,29 @@
+(* wac.cm
+ * Compilation Manager file for Windows Ansible Core
+ *)
+
+Group is
+  (* Core Library *)
+  permission.sig
+  permission.sml
+  inventory.sig
+  inventory.sml
+  windows_module.sig
+  windows_module.sml
+  task_executor.sig
+  task_executor.sml
+  playbook.sig
+  playbook.sml
+  template.sig
+  template.sml
+  vault.sig
+  vault.sml
+  active_directory.sig
+  active_directory.sml
+  
+  (* Main program *)
+  main.sml
+  
+  (* Standard ML Basis Library *)
+  $/basis.cm
+  $/smlnj-lib.cm
