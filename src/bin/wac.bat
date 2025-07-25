@@ -1,36 +1,42 @@
 @echo off
-SETLOCAL EnableDelayedExpansion
+setlocal
 
-REM Check if arguments provided
-IF "%~1"=="" (
-  ECHO Error: Invalid command. Use: inventory, playbook, module, or vault
-  ECHO Usage: wac [inventory^|playbook^|module^|vault] [options]
-  EXIT /B 1
+if "%1"=="" (
+  echo Error: Invalid command. Use: inventory, playbook, module, or vault
+  echo Usage: wac [inventory^|playbook^|module^|vault] [options]
+  pause
+  exit /b 1
 )
 
-SET CMD=%1
-SHIFT
+set CMD=%1
+shift
 
-IF "%CMD%"=="inventory" (
-  CALL %~dp0\inventory.bat %*
-  EXIT /B %ERRORLEVEL%
-)
+if "%CMD%"=="inventory" goto run_inventory
+if "%CMD%"=="playbook" goto run_playbook
+if "%CMD%"=="vault" goto run_vault
+if "%CMD%"=="module" goto run_module
 
-IF "%CMD%"=="playbook" (
-  CALL %~dp0\playbook.bat %*
-  EXIT /B %ERRORLEVEL%
-)
+echo Unknown command: %CMD%
+echo Usage: wac [inventory^|playbook^|module^|vault] [options]
+pause
+exit /b 1
 
-IF "%CMD%"=="vault" (
-  CALL %~dp0\vault.bat %*
-  EXIT /B %ERRORLEVEL%
-)
+:run_inventory
+call "%~dp0inventory.bat" %*
+pause
+exit /b %ERRORLEVEL%
 
-IF "%CMD%"=="module" (
-  CALL %~dp0\module.bat %*
-  EXIT /B %ERRORLEVEL%
-)
+:run_playbook
+call "%~dp0playbook.bat" %*
+pause
+exit /b %ERRORLEVEL%
 
-ECHO Unknown command: %CMD%
-ECHO Usage: wac [inventory^|playbook^|module^|vault] [options]
-EXIT /B 1
+:run_vault
+call "%~dp0vault.bat" %*
+pause
+exit /b %ERRORLEVEL%
+
+:run_module
+call "%~dp0module.bat" %*
+pause
+exit /b %ERRORLEVEL%
